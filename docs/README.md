@@ -154,17 +154,6 @@ Body (recursive):
   Collection:      uint32 num_parts, each with type byte + recursive body
 ```
 
-## Building
-
-Requires DuckDB v1.5.0+ (GEOMETRY type is in core).
-
-```sh
-git clone --recurse-submodules https://github.com/Query-farm/geosilo.git
-cd geosilo
-GEN=ninja make release
-```
-
-Extension: `build/release/extension/geosilo/geosilo.duckdb_extension`
 
 ---
 
