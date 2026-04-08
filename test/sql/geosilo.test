@@ -200,6 +200,156 @@ SELECT silo_metadata(NULL::BLOB);
 NULL
 
 # ---------------------------------------------------------------------------
+# silo_metadata — all geometry types
+# ---------------------------------------------------------------------------
+
+query III
+SELECT m.geometry_type, m.vertex_type, m.scale
+FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('LINESTRING EMPTY'))) AS m);
+----
+LINESTRING	XY	10000000
+
+query III
+SELECT m.geometry_type, m.vertex_type, m.scale
+FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 0))'))) AS m);
+----
+POLYGON	XY	10000000
+
+query III
+SELECT m.geometry_type, m.vertex_type, m.scale
+FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('MULTIPOINT(0 0, 1 1)'))) AS m);
+----
+MULTIPOINT	XY	10000000
+
+query III
+SELECT m.geometry_type, m.vertex_type, m.scale
+FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('MULTILINESTRING((0 0, 1 1), (2 2, 3 3))'))) AS m);
+----
+MULTILINESTRING	XY	10000000
+
+query III
+SELECT m.geometry_type, m.vertex_type, m.scale
+FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('GEOMETRYCOLLECTION(POINT(0 0))'))) AS m);
+----
+GEOMETRYCOLLECTION	XY	10000000
+
+# silo_metadata on invalid blob
+statement error
+SELECT silo_metadata('\x00\x01\x02\x03'::BLOB);
+----
+GeoSilo: invalid blob
+
+# ---------------------------------------------------------------------------
+# More empty geometry types
+# ---------------------------------------------------------------------------
+
+query I
+SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('MULTIPOINT EMPTY'))));
+----
+MULTIPOINT EMPTY
+
+query I
+SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('MULTILINESTRING EMPTY'))));
+----
+MULTILINESTRING EMPTY
+
+query I
+SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('GEOMETRYCOLLECTION EMPTY'))));
+----
+GEOMETRYCOLLECTION EMPTY
+
+# ---------------------------------------------------------------------------
+# Negative coordinates
+# ---------------------------------------------------------------------------
+
+query I
+SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(-180 -90)'))));
+----
+POINT (-180 -90)
+
+query I
+SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('LINESTRING(-180 -90, -170 -80, -160 -70)'))));
+----
+LINESTRING (-180 -90, -170 -80, -160 -70)
+
+# ---------------------------------------------------------------------------
+# Many vertices — verifies delta chain doesn't accumulate errors
+# ---------------------------------------------------------------------------
+
+# Generate a linestring with 100 points: (0,0), (1,0), (2,0), ..., (99,0)
+query I
+SELECT ST_NPoints(silo_decode(silo_encode(
+    ST_MakeLine(list(ST_Point(i, 0)))
+))) FROM range(100) t(i);
+----
+100
+
+# Verify first and last coordinates survive roundtrip
+query II
+SELECT ST_X(ST_PointN(decoded, 1)), ST_X(ST_PointN(decoded, 100))
+FROM (
+    SELECT silo_decode(silo_encode(
+        ST_MakeLine(list(ST_Point(i, 0)))
+    )) AS decoded FROM range(100) t(i)
+);
+----
+0.0	99.0
+
+# ---------------------------------------------------------------------------
+# Variable-width delta encoding — int16 vs int32 escape
+# ---------------------------------------------------------------------------
+
+# Small deltas should produce a smaller blob than large deltas
+# Nearby points: deltas fit in int16 (2 bytes each)
+# Far points: deltas need int32 escape (6 bytes each)
+query I
+SELECT octet_length(silo_encode(ST_GeomFromText('LINESTRING(0 0, 0.001 0.001, 0.002 0.002)')))
+     < octet_length(silo_encode(ST_GeomFromText('LINESTRING(0 0, 100 100, -100 -100)')));
+----
+true
+
+# ---------------------------------------------------------------------------
+# Batch processing — encode/decode over multiple rows
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM (
+    SELECT silo_decode(silo_encode(ST_Point(i * 0.01, i * 0.02))) AS geom
+    FROM range(1000) t(i)
+) WHERE round(ST_X(geom), 2) = round(ST_Y(geom) / 2, 2);
+----
+1000
+
+# ---------------------------------------------------------------------------
+# NULL in batch — NULLs should pass through without affecting other rows
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM (
+    SELECT silo_decode(silo_encode(CASE WHEN i % 3 = 0 THEN NULL ELSE ST_Point(i, i) END)) AS geom
+    FROM range(9) t(i)
+) WHERE geom IS NULL;
+----
+3
+
+query I
+SELECT count(*) FROM (
+    SELECT silo_decode(silo_encode(CASE WHEN i % 3 = 0 THEN NULL ELSE ST_Point(i, i) END)) AS geom
+    FROM range(9) t(i)
+) WHERE geom IS NOT NULL;
+----
+6
+
+# ---------------------------------------------------------------------------
+# silo_metadata NULL in batch
+# ---------------------------------------------------------------------------
+
+query I
+SELECT silo_metadata(NULL::BLOB) IS NULL;
+----
+true
+
+# ---------------------------------------------------------------------------
 # Invalid input
 # ---------------------------------------------------------------------------
 
@@ -214,3 +364,49 @@ statement error
 SELECT silo_decode('\x47\x01'::BLOB);
 ----
 GeoSilo: unexpected end of blob
+
+# Wrong version byte
+statement error
+SELECT silo_decode('\x47\xFF\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB);
+----
+GeoSilo: unsupported version
+
+# ---------------------------------------------------------------------------
+# Scale auto-detection from CRS
+# ---------------------------------------------------------------------------
+# Note: DuckDB's spatial extension does not yet propagate CRS to the GEOMETRY
+# LogicalType (ST_Transform returns plain GEOMETRY). Once it does, silo_encode
+# will auto-detect scale from CRS. For now, verify explicit scale roundtrips
+# preserve the scale in the blob header.
+
+# Default scale (1e7) for WGS84-range coordinates
+query I
+SELECT (silo_metadata(silo_encode(ST_GeomFromText('POINT(1 2)')))).scale;
+----
+10000000
+
+# Explicit scale 100 (projected CRS)
+query I
+SELECT (silo_metadata(silo_encode(ST_GeomFromText('POINT(500000 4500000)'), 100))).scale;
+----
+100
+
+# Explicit scale 30 (US survey feet)
+query I
+SELECT (silo_metadata(silo_encode(ST_GeomFromText('POINT(1000000 500000)'), 30))).scale;
+----
+30
+
+# Scale roundtrip: decode uses the scale stored in the blob, not a global default
+query I
+SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(500000 4500000)'), 100)));
+----
+POINT (500000 4500000)
+
+# Same point encoded with different scales produces different decoded values
+# (because quantization differs)
+query I
+SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(1.23456789 2.34567891)'), 100)))
+    != ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(1.23456789 2.34567891)'), 10000000)));
+----
+true
