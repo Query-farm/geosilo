@@ -60,7 +60,7 @@ SELECT silo_encode(geom, 100) FROM my_utm_table;
 
 Geometry column size on US Census TIGER/Line 2025 boundary data (WGS84). All ratios relative to standard WKB.
 
-| Table | Rows | WKB | Silo | Silo + ZSTD |
+| Table | Rows | WKB | GeoSilo | GeoSilo + ZSTD |
 |---|---|---|---|---|
 | block_group | 242,748 | 209 MB | 68 MB (0.33x) | 58 MB (0.28x) |
 | zcta5 | 33,791 | 180 MB | 53 MB (0.29x) | 48 MB (0.26x) |
