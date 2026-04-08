@@ -6,8 +6,13 @@
 #include "duckdb/common/types/geometry.hpp"
 #include "duckdb/common/types/geometry_crs.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/arrow_type_extension.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
+#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
+#include "duckdb/function/table/arrow/arrow_type_info.hpp"
 #include "duckdb/main/config.hpp"
+#include "yyjson.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
@@ -542,11 +547,68 @@ static void SiloMetadataFunction(DataChunk &args, ExpressionState &state, Vector
 // ---------------------------------------------------------------------------
 // Arrow extension type: "queryfarm.geosilo"
 // ---------------------------------------------------------------------------
-// When an Arrow column is tagged with ARROW:extension:name = "queryfarm.geosilo",
-// DuckDB automatically decodes silo blobs to GEOMETRY on read, and encodes
-// GEOMETRY to silo blobs on write.
+// CRS is carried in the Arrow extension metadata as {"crs": "EPSG:4326"}.
+// On read (ArrowToDuck), the CRS is parsed and attached to the GEOMETRY type.
+// On write (DuckToArrow/PopulateSchema), the CRS from the GEOMETRY type is
+// written to the metadata and used to auto-detect scale.
 
 struct ArrowGeoSilo {
+	// Parse Arrow metadata → GEOMETRY type (with optional CRS)
+	static unique_ptr<ArrowType> GetType(ClientContext &context, const ArrowSchema &schema,
+	                                     const ArrowSchemaMetadata &schema_metadata) {
+		const auto extension_metadata = schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_METADATA_KEY);
+
+		unique_ptr<CoordinateReferenceSystem> duckdb_crs;
+		if (!extension_metadata.empty()) {
+			unique_ptr<duckdb_yyjson::yyjson_doc, void (*)(duckdb_yyjson::yyjson_doc *)> doc(
+			    duckdb_yyjson::yyjson_read(extension_metadata.data(), extension_metadata.size(),
+			                               duckdb_yyjson::YYJSON_READ_NOFLAG),
+			    duckdb_yyjson::yyjson_doc_free);
+			if (doc) {
+				auto *root = yyjson_doc_get_root(doc.get());
+				if (yyjson_is_obj(root)) {
+					auto *crs_val = yyjson_obj_get(root, "crs");
+					if (crs_val && yyjson_is_str(crs_val)) {
+						duckdb_crs = CoordinateReferenceSystem::TryIdentify(context, yyjson_get_str(crs_val));
+					}
+				}
+			}
+		}
+
+		auto geo_type = duckdb_crs ? LogicalType::GEOMETRY(*duckdb_crs) : LogicalType::GEOMETRY();
+		const auto format = string(schema.format);
+		if (format == "z") {
+			return make_uniq<ArrowType>(std::move(geo_type), make_uniq<ArrowStringInfo>(ArrowVariableSizeType::NORMAL));
+		}
+		if (format == "Z") {
+			return make_uniq<ArrowType>(std::move(geo_type),
+			                            make_uniq<ArrowStringInfo>(ArrowVariableSizeType::SUPER_SIZE));
+		}
+		throw InvalidInputException("Arrow format \"%s\" not supported for queryfarm.geosilo", format.c_str());
+	}
+
+	// GEOMETRY type → Arrow schema metadata (with optional CRS)
+	static void PopulateSchema(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &schema, const LogicalType &type,
+	                           ClientContext &context, const ArrowTypeExtension &extension) {
+		ArrowSchemaMetadata schema_metadata;
+		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME, "queryfarm.geosilo");
+
+		if (GeoType::HasCRS(type)) {
+			auto &crs = GeoType::GetCRS(type);
+			auto crs_id = crs.GetIdentifier();
+			auto json_str = "{\"crs\":\"" + crs_id + "\"}";
+			schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY, json_str);
+		} else {
+			schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY, "{}");
+		}
+
+		root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
+		schema.metadata = root_holder.metadata_info.back().get();
+
+		const auto options = context.GetClientProperties();
+		schema.format = (options.arrow_offset_size == ArrowOffsetSize::LARGE) ? "Z" : "z";
+	}
+
 	// Arrow → DuckDB: silo blob → GEOMETRY
 	static void ArrowToDuck(ClientContext &context, Vector &source, Vector &result, idx_t count) {
 		Vector wkb_vec(LogicalType::BLOB, count);
@@ -562,7 +624,6 @@ struct ArrowGeoSilo {
 	}
 
 	// DuckDB → Arrow: GEOMETRY → silo blob
-	// Detects CRS on the source GEOMETRY type to pick the right scale.
 	static void DuckToArrow(ClientContext &context, Vector &source, Vector &result, idx_t count) {
 		int64_t scale = DEFAULT_SCALE;
 		if (source.GetType().id() == LogicalTypeId::GEOMETRY && GeoType::HasCRS(source.GetType())) {
@@ -616,7 +677,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	try {
 		config.RegisterArrowExtension(
-		    {"queryfarm.geosilo", nullptr, nullptr,
+		    {"queryfarm.geosilo", ArrowGeoSilo::PopulateSchema, ArrowGeoSilo::GetType,
 		     make_shared_ptr<ArrowTypeExtensionData>(LogicalType::GEOMETRY(), LogicalType::BLOB,
 		                                             ArrowGeoSilo::ArrowToDuck, ArrowGeoSilo::DuckToArrow)});
 	} catch (...) {

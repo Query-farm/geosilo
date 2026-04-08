@@ -122,16 +122,25 @@ Without `storage_compatibility_version='latest'`, `USING COMPRESSION zstd` is si
 
 GeoSilo registers an [Arrow extension type](https://arrow.apache.org/docs/format/Columnar.html#extension-types) named `queryfarm.geosilo`. When an Arrow column carries this metadata, DuckDB (with geosilo loaded) automatically decodes silo blobs to GEOMETRY on read and encodes GEOMETRY to silo blobs on write — no explicit `silo_decode` needed.
 
+CRS is preserved through the Arrow metadata. The extension metadata JSON carries `{"crs": "EPSG:4326"}` (or similar), which is attached to the GEOMETRY type on decode and used to auto-detect scale on encode.
+
 **Producer (Python/PyArrow):**
 
 ```python
+# Without CRS
 geom_field = pa.field("geom", pa.binary(), metadata={
     b"ARROW:extension:name": b"queryfarm.geosilo",
     b"ARROW:extension:metadata": b"",
 })
+
+# With CRS
+geom_field = pa.field("geom", pa.binary(), metadata={
+    b"ARROW:extension:name": b"queryfarm.geosilo",
+    b"ARROW:extension:metadata": b'{"crs":"EPSG:4326"}',
+})
 ```
 
-**Consumer:** DuckDB with geosilo loaded receives GEOMETRY automatically.
+**Consumer:** DuckDB with geosilo loaded receives `GEOMETRY` (or `GEOMETRY(EPSG:4326)` if CRS is present) automatically.
 
 ## Binary format
 
