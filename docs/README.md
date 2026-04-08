@@ -58,15 +58,15 @@ SELECT silo_encode(geom, 100) FROM my_utm_table;
 
 ## Benchmarks
 
-Geometry column size on US Census TIGER/Line 2025 boundary data (WGS84). All ratios relative to standard WKB.
+Geometry column compression vs standard WKB on US Census TIGER/Line 2025 (WGS84):
 
-| Table | Rows | WKB | GeoSilo | GeoSilo + ZSTD |
-|---|---|---|---|---|
-| block_group | 242,748 | 209 MB | 68 MB (0.33x) | 58 MB (0.28x) |
-| zcta5 | 33,791 | 180 MB | 53 MB (0.29x) | 48 MB (0.26x) |
-| tract | 85,529 | 125 MB | 40 MB (0.32x) | 34 MB (0.27x) |
-| county | 3,235 | 25 MB | 8 MB (0.31x) | 7 MB (0.27x) |
-| urban_area | 2,644 | 23 MB | 7 MB (0.29x) | 6 MB (0.26x) |
+| Table | Rows | GeoSilo | GeoSilo + ZSTD |
+|---|---|---|---|
+| block_group | 242,748 | 0.33x | 0.28x |
+| zcta5 | 33,791 | 0.29x | 0.26x |
+| tract | 85,529 | 0.32x | 0.27x |
+| county | 3,235 | 0.31x | 0.27x |
+| urban_area | 2,644 | 0.29x | 0.26x |
 
 Reproduce with: `./build/release/duckdb -f scripts/benchmark.sql` (requires `tiger.duckdb` in the working directory).
 
