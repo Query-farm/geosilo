@@ -165,3 +165,7 @@ GEN=ninja make release
 ```
 
 Extension: `build/release/extension/geosilo/geosilo.duckdb_extension`
+
+---
+
+Copyright 2026 [Query.Farm LLC](https://query.farm)
