@@ -1,185 +1,204 @@
-# DuckDB Extension Template
-This repository contains a template for creating a DuckDB extension. The main goal of this template is to allow users to easily develop, test and distribute their own DuckDB extension. The main branch of the template is always based on the latest stable DuckDB allowing you to try out your extension right away.
+# GeoSilo
 
-## Getting started
-First step to getting started is to create your own repo from this template by clicking `Use this template`. Then clone your new repository using 
-```sh
-git clone --recurse-submodules https://github.com/<you>/<your-new-extension-repo>.git
+A DuckDB extension for compact geometry encoding. Reduces geometry storage and wire transfer size by delta-encoding coordinates as scaled int32 values instead of float64 pairs. Combined with DuckDB's ZSTD compression, achieves up to 3.8x reduction in geometry storage compared to default GEOMETRY.
+
+## Functions
+
+### `silo_encode(geom)` / `silo_encode(geom, scale)`
+
+Encodes a GEOMETRY column into a compact binary blob using delta-encoded coordinates.
+
+- **geom** (GEOMETRY) — input geometry (any type: Point, LineString, Polygon, Multi*, GeometryCollection)
+- **scale** (BIGINT, optional) — coordinate scale factor. Default `10000000` (1e7), which gives ~1cm precision for WGS84 (EPSG:4326). Use `100` for projected CRS in meters.
+- **Returns** BLOB
+
+```sql
+-- Default scale (WGS84)
+SELECT silo_encode(geom) FROM my_table;
+
+-- Custom scale for UTM coordinates (meters, 1cm precision)
+SELECT silo_encode(geom, 100) FROM my_table;
 ```
-Note that `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
+
+### `silo_decode(blob)`
+
+Decodes a GeoSilo blob back into a GEOMETRY value.
+
+- **blob** (BLOB) — GeoSilo-encoded geometry
+- **Returns** GEOMETRY
+
+```sql
+SELECT ST_AsText(silo_decode(encoded_geom)) FROM my_table;
+```
+
+### Roundtrip
+
+```sql
+SELECT ST_AsText(silo_decode(silo_encode(
+    ST_GeomFromText('POLYGON((-75.5 39.7, -75.4 39.8, -75.3 39.7, -75.5 39.7))')
+)));
+-- POLYGON ((-75.5 39.7, -75.4 39.8, -75.3 39.7, -75.5 39.7))
+```
+
+## How it works
+
+GeoSilo uses the same structure as WKB (geometry type, part counts, ring counts, coordinate sequences) but replaces float64 coordinate pairs with delta-encoded int32 values:
+
+1. Coordinates are scaled to integers (e.g., -75.509491 * 1e7 = -755094910)
+2. The first coordinate in each ring/linestring is stored as an absolute int32
+3. Subsequent coordinates are stored as deltas from the previous value (typically small numbers)
+4. The scale factor is stored in the blob header, so decoding needs no configuration
+
+The delta values are small because adjacent vertices in a polygon are spatially close. General-purpose compressors like ZSTD achieve ~3.5x compression on the delta-encoded data vs ~1.1x on raw WKB, because the small integer deltas have highly repetitive byte patterns.
+
+### Why delta encoding beats other approaches
+
+| Encoding | Arrow IPC + ZSTD | Ratio |
+|---|---|---|
+| Raw float64 (WKB) | 15.2 MB | 1.00x |
+| Byte-stream split (Parquet-style) | 11.2 MB | 0.65x |
+| XOR delta (Gorilla) | 12.9 MB | 0.75x |
+| **Delta int32 (GeoSilo)** | **5.5 MB** | **0.36x** |
+
+Adjacent coordinates in a polygon share similar values, but IEEE 754 double encoding obscures this at the byte level. Delta encoding captures the spatial adjacency directly — the difference between -75.509491 and -75.509089 is just 402 in 1e-7 degree units, which ZSTD compresses trivially.
+
+### Binary format
+
+```
+Header (14 bytes):
+  magic            1 byte   0x47 ('G')
+  version          1 byte   0x01
+  geometry_type    1 byte   (1=Point, 2=LineString, 3=Polygon, 4-6=Multi*, 7=Collection)
+  vertex_type      1 byte   (0=XY, 1=XYZ, 2=XYM, 3=XYZM)
+  scale            8 bytes  int64 LE
+
+Coordinate encoding:
+  First per ring/line: int32 absolute (4 bytes per dimension)
+  Subsequent deltas:   int16 (2 bytes) if value fits [-32767, 32767]
+                       otherwise: int16 sentinel -32768, then int32 (6 bytes)
+  Empty point (NaN):   INT32_MAX sentinel per dimension
+
+Body (recursive):
+  Point:           D int32 values (absolute, D = vertex dimension)
+  LineString:      uint32 num_points, then delta-encoded coordinates
+  Polygon:         uint32 num_rings, per ring: uint32 num_points + delta coords
+  Multi*:          uint32 num_parts, each part encoded recursively
+  Collection:      uint32 num_parts, each with type byte + recursive encoding
+```
+
+~90% of coordinate deltas fit in int16, using 2 bytes instead of the full 8-byte float64. The remaining ~10% use the 6-byte escape path. Combined with the int32 first coordinate (vs 8-byte double), this achieves ~70% raw size reduction before any external compression.
+
+## Benchmarks
+
+Tested on US Census TIGER/Line 2025 boundary data (WGS84, 2048-row row groups). All ratios relative to 1.00x = default GEOMETRY size. Reproduce with:
+
+```sh
+cd /path/to/directory/with/tiger.duckdb
+/path/to/geosilo/build/release/duckdb -f /path/to/geosilo/scripts/benchmark.sql
+```
+
+### On-disk storage (geom column only, 256 KB blocks)
+
+| Table | Default | Shredded+ALP | Silo | Silo+ZSTD |
+|---|---|---|---|---|
+| block_group | 294 MB (1.00x) | 182 MB (0.62x) | 75 MB (0.25x) | 71 MB (0.24x) |
+| zcta5 | 189 MB (1.00x) | 76 MB (0.40x) | 71 MB (0.38x) | 71 MB (0.38x) |
+| county | 25 MB (1.00x) | 11 MB (0.44x) | 8 MB (0.34x) | 8 MB (0.34x) |
+| urban_area | 24 MB (1.00x) | 10 MB (0.42x) | 9 MB (0.37x) | 9 MB (0.37x) |
+
+### Wire transfer (geometry column serialized size)
+
+| Table | Rows | WKB (1.00x) | Silo | WKB+ZSTD | Silo+ZSTD |
+|---|---|---|---|---|---|
+| block_group | 242,748 | 209.2 MB | 68.4 MB (0.33x) | 129.1 MB (0.62x) | 57.5 MB (0.28x) |
+| zcta5 | 33,791 | 180.0 MB | 52.9 MB (0.29x) | 134.9 MB (0.75x) | 47.6 MB (0.26x) |
+| tract | 85,529 | 124.6 MB | 39.5 MB (0.32x) | 75.6 MB (0.61x) | 34.1 MB (0.27x) |
+| county | 3,235 | 24.6 MB | 7.5 MB (0.31x) | 19.7 MB (0.80x) | 6.7 MB (0.27x) |
+| urban_area | 2,644 | 23.2 MB | 6.9 MB (0.29x) | 18.3 MB (0.79x) | 6.1 MB (0.26x) |
+| coastline | 4,240 | 7.2 MB | 2.1 MB (0.29x) | 5.7 MB (0.80x) | 1.9 MB (0.26x) |
+| state | 56 | 3.2 MB | 1.1 MB (0.35x) | 2.4 MB (0.76x) | 0.9 MB (0.29x) |
+
+## Enabling ZSTD compression for stored blobs
+
+DuckDB does not apply ZSTD to BLOB columns by default. Two requirements:
+
+1. **Set `storage_compatibility_version` to `latest`** — ZSTD compression requires serialization version 4+ (v1.5.0+). Without this, DuckDB silently falls back to uncompressed storage.
+
+2. **Specify `USING COMPRESSION zstd` on the column** — DuckDB's auto-compression won't select ZSTD for BLOBs. You must declare it in the CREATE TABLE.
+
+```sql
+-- Both are required for ZSTD-compressed silo blobs
+PRAGMA storage_compatibility_version='latest';
+
+CREATE TABLE my_table (
+    id INTEGER,
+    name VARCHAR,
+    geom BLOB USING COMPRESSION zstd   -- explicit ZSTD on the silo column
+);
+
+INSERT INTO my_table
+SELECT id, name, silo_encode(geom) FROM source_table;
+```
+
+Without `storage_compatibility_version='latest'`, `USING COMPRESSION zstd` is silently ignored and blobs are stored uncompressed.
+
+GeoSilo achieves **0.24-0.38x** on-disk storage vs default GEOMETRY, and **0.26-0.29x** wire transfer size vs WKB when both are ZSTD-compressed. It outperforms DuckDB's native shredded ALP compression by ~1.5-2.5x because delta-encoded int16 values compress far better than ALP-encoded float64 arrays.
+
+## Scale and precision
+
+At the default scale of 1e7, coordinates are quantized to 1e-7 degrees (~1cm at the equator). The scale factor is stored in the blob header, so decoding never needs configuration.
+
+### Automatic scale detection
+
+When the GEOMETRY column carries a CRS (e.g., `GEOMETRY(EPSG:4326)`), `silo_encode` automatically selects the appropriate scale:
+
+| CRS | Units | Auto Scale | Precision |
+|---|---|---|---|
+| EPSG:4326 (WGS84) | degrees | 10,000,000 | ~1cm |
+| EPSG:4269 (NAD83) | degrees | 10,000,000 | ~1cm |
+| EPSG:326xx (UTM) | meters | 100 | 1cm |
+| EPSG:3857 (Web Mercator) | meters | 100 | 1cm |
+| No CRS | — | 10,000,000 (default) | ~1cm for degrees |
+
+An explicit scale parameter always overrides auto-detection:
+
+```sql
+-- Force scale for a projected CRS in meters
+SELECT silo_encode(geom, 100) FROM my_utm_table;
+```
 
 ## Building
-### Managing dependencies
-> [!IMPORTANT]  
-> The example extension uses VCPKG to build with a dependency for instructive purposes, so when skipping this step the build may not work without removing the dependency.
 
-DuckDB extensions uses VCPKG for dependency management. Enabling VCPKG is very simple: follow the [installation instructions](https://vcpkg.io/en/getting-started) or just run the following:
-```shell
-cd <your-working-dir-not-the-plugin-repo>
-git clone https://github.com/Microsoft/vcpkg.git
-cd vcpkg && git checkout ce613c41372b23b1f51333815feb3edd87ef8a8b
-sh ./scripts/bootstrap.sh -disableMetrics
-export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
-```
-
-> [!NOTE]
-> VCPKG is only required for extensions that want to rely on it for dependency management. If you want to develop an extension without dependencies, or want to do your own dependency management, just skip this step. 
-
-### Updating Submodules
-DuckDB extensions use two submodules that are included in your forked extension repo when you use the `--recurse-submodules` flag. These modules are:
-
-| Name                  | Repository                                      | Description |
-|-----------------------|-------------------------------------------------|-------------|
-| duckdb                | https://github.com/duckdb/duckdb                | This repository contains core DuckDB code required for building extensions.            |
-| extension-ci-tools    | https://github.com/duckdb/extension-ci-tools    | This repository contains reusable components for building, testing and deploying DuckDB extensions.            |
-
-
-> [!IMPORTANT]  
-> It is recommended that you update your submodules at least once every other major LTS release to avoid CI/CD pipeline build errors caused by remaining pinned to a stale commit of these submodules.
-
-To update all submodules to the latest commit hash:
-```bash
-git submodule update --init --recursive
-```
-
-To update your submodules to a specific commit hash, for example to update duckdb to the hash `8e146474d7adb960c5a2941142fe4482cc7dfc08`:
-```bash
-cd duckdb 
-git fetch --all
-git checkout 8e146474d7adb960c5a2941142fe4482cc7dfc08   # or any tag/branch/commit hash
-cd ..
-git add duckdb
-git commit -m "Pin DuckDB submodule to cc7dfc08"
-git push HEAD:update-submodule-branch
-```
-
-### Build steps
-Now to build the extension, run:
-```sh
-make
-```
-The main binaries that will be built are:
-```sh
-./build/release/duckdb
-./build/release/test/unittest
-./build/release/extension/<extension_name>/<extension_name>.duckdb_extension
-```
-- `duckdb` is the binary for the duckdb shell with the extension code automatically loaded. 
-- `unittest` is the test runner of duckdb. Again, the extension is already linked into the binary.
-- `<extension_name>.duckdb_extension` is the loadable binary as it would be distributed.
-
-### Tips for speedy builds
-DuckDB extensions currently rely on DuckDB's build system to provide easy testing and distributing. This does however come at the downside of requiring the template to build DuckDB and its unittest binary every time you build your extension. To mitigate this, we highly recommend installing [ccache](https://ccache.dev/) and [ninja](https://ninja-build.org/). This will ensure you only need to build core DuckDB once and allows for rapid rebuilds.
-
-To build using ninja and ccache ensure both are installed and run:
+Requires DuckDB v1.5.0+ (GEOMETRY type is in core).
 
 ```sh
-GEN=ninja make
+git clone --recurse-submodules https://github.com/Query-farm/geosilo.git
+cd geosilo
+GEN=ninja make release
 ```
 
-## Running the extension
-To run the extension code, simply start the shell with `./build/release/duckdb`. This shell will have the extension pre-loaded.  
+The built extension is at `build/release/extension/geosilo/geosilo.duckdb_extension`.
 
-Now we can use the features from the extension directly in DuckDB. The template contains a single scalar function `quack()` that takes a string arguments and returns a string:
+## Usage with the spatial extension
+
+GeoSilo works alongside the spatial extension — use spatial functions to create and manipulate geometry, and GeoSilo for compact encoding:
+
+```sql
+INSTALL spatial;
+LOAD spatial;
+LOAD geosilo;
+
+-- Encode for compact storage or transfer
+PRAGMA storage_compatibility_version='latest';
+
+CREATE TABLE compact (
+    id INTEGER,
+    geom BLOB USING COMPRESSION zstd
+);
+
+INSERT INTO compact
+SELECT id, silo_encode(geom) FROM source_table;
+
+-- Decode back for spatial operations
+SELECT ST_Area(silo_decode(geom)) FROM compact;
 ```
-D select quack('Jane') as result;
-┌───────────────┐
-│    result     │
-│    varchar    │
-├───────────────┤
-│ Quack Jane 🐥 │
-└───────────────┘
-```
-
-## Running the tests
-Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:
-```sh
-make test
-```
-
-## Getting started with your own extension
-After creating a repository from this template, the first step is to name your extension. To rename the extension, run:
-```sh
-# Note: This will rewrite this file!
-python3 ./scripts/bootstrap-template.py <extension_name_you_want>
-```
-Feel free to delete the script after this step.
-
-Now you're good to go! After a (re)build, you should now be able to use your duckdb extension:
-```
-./build/release/duckdb
-D select <extension_name_you_chose>('Jane') as result;
-┌─────────────────────────────────────┐
-│                result               │
-│               varchar               │
-├─────────────────────────────────────┤
-│ <extension_name_you_chose> Jane 🐥  │
-└─────────────────────────────────────┘
-```
-
-For inspiration/examples on how to extend DuckDB in a more meaningful way, check out the [test extensions](https://github.com/duckdb/duckdb/blob/main/test/extension),
-the [in-tree extensions](https://github.com/duckdb/duckdb/tree/main/extension), and the [out-of-tree extensions](https://github.com/duckdblabs).
-
-## Distributing your extension
-To distribute your extension binaries, there are a few options.
-
-### Community extensions
-The recommended way of distributing extensions is through the [community extensions repository](https://github.com/duckdb/community-extensions).
-This repository is designed specifically for extensions that are built using this extension template, meaning that as long as your extension can be
-built using the default CI in this template, submitting it to the community extensions is a very simple process. The process works similarly to popular
-package managers like homebrew and vcpkg, where a PR containing a descriptor file is submitted to the package manager repository. After the CI in the 
-community extensions repository completes, the extension can be installed and loaded in DuckDB with:
-```SQL
-INSTALL <my_extension> FROM community;
-LOAD <my_extension>
-```
-For more information, see the [community extensions documentation](https://duckdb.org/community_extensions/documentation).
-
-### Downloading artifacts from GitHub
-The default CI in this template will automatically upload the binaries for every push to the main branch as GitHub Actions artifacts. These
-can be downloaded manually and then loaded directly using:
-```SQL
-LOAD '/path/to/downloaded/extension.duckdb_extension';
-```
-Note that this will require starting DuckDB with the
-`allow_unsigned_extensions` option set to true. How to set this will depend on the client you're using. For the CLI it is done like:
-```shell
-duckdb -unsigned
-```
-
-### Uploading to a custom repository
-If for some reason distributing through community extensions is not an option, extensions can also be uploaded to a custom extension repository.
-This will give some more control over where and how the extensions are distributed, but comes with the downside of requiring the `allow_unsigned_extensions`
-option to be set. For examples of how to configure a manual GitHub Actions deploy pipeline, check out the extension deploy script in https://github.com/duckdb/extension-ci-tools.
-Some examples of extensions that use this CI/CD workflow check out [spatial](https://github.com/duckdblabs/duckdb_spatial) or [aws](https://github.com/duckdb/duckdb_aws).
-
-Extensions in custom repositories can be installed and loaded using:
-```SQL
-INSTALL <my_extension> FROM 'http://my-custom-repo'
-LOAD <my_extension>
-```
-
-### Versioning of your extension
-Extension binaries will only work for the specific DuckDB version they were built for. The version of DuckDB that is targeted 
-is set to the latest stable release for the main branch of the template so initially that is all you need. As new releases 
-of DuckDB are published however, the extension repository will need to be updated. The template comes with a workflow set-up
-that will automatically build the binaries for all DuckDB target architectures that are available in the corresponding DuckDB
-version. This workflow is found in `.github/workflows/MainDistributionPipeline.yml`. It is up to the extension developer to keep
-this up to date with DuckDB. Note also that its possible to distribute binaries for multiple DuckDB versions in this workflow 
-by simply duplicating the jobs.
-
-## Setting up CLion 
-
-### Opening project
-Configuring CLion with the extension template requires a little work. Firstly, make sure that the DuckDB submodule is available. 
-Then make sure to open `./duckdb/CMakeLists.txt` (so not the top level `CMakeLists.txt` file from this repo) as a project in CLion.
-Now to fix your project path go to `tools->CMake->Change Project Root`([docs](https://www.jetbrains.com/help/clion/change-project-root-directory.html)) to set the project root to the root dir of this repo.
-
-### Debugging
-To set up debugging in CLion, there are two simple steps required. Firstly, in `CLion -> Settings / Preferences -> Build, Execution, Deploy -> CMake` you will need to add the desired builds (e.g. Debug, Release, RelDebug, etc). There's different ways to configure this, but the easiest is to leave all empty, except the `build path`, which needs to be set to `../build/{build type}`, and CMake Options to which the following flag should be added, with the path to the extension CMakeList:
-
-```
--DDUCKDB_EXTENSION_CONFIGS=<path_to_the_exentension_CMakeLists.txt>
-```
-
-The second step is to configure the unittest runner as a run/debug configuration. To do this, go to `Run -> Edit Configurations` and click `+ -> Cmake Application`. The target and executable should be `unittest`. This will run all the DuckDB tests. To specify only running the extension specific tests, add `--test-dir ../../.. [sql]` to the `Program Arguments`. Note that it is recommended to use the `unittest` executable for testing/development within CLion. The actual DuckDB CLI currently does not reliably work as a run target in CLion.
