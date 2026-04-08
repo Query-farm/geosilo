@@ -16,6 +16,8 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
+#include "query_farm_telemetry.hpp"
+
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -647,18 +649,20 @@ struct ArrowGeoSilo {
 // ---------------------------------------------------------------------------
 
 static void LoadInternal(ExtensionLoader &loader) {
+	QueryFarmSendTelemetry(loader, "geosilo", GeosiloExtension().Version());
+
 	// silo_encode(GEOMETRY) → BLOB
-	auto encode_fn = ScalarFunction("silo_encode", {LogicalType::GEOMETRY()}, LogicalType::BLOB,
+	auto encode_fn = ScalarFunction("geosilo_encode", {LogicalType::GEOMETRY()}, LogicalType::BLOB,
 	                                SiloEncodeFunction, SiloEncodeBind);
 	loader.RegisterFunction(encode_fn);
 
 	// silo_encode(GEOMETRY, BIGINT) → BLOB
-	auto encode_scale_fn = ScalarFunction("silo_encode", {LogicalType::GEOMETRY(), LogicalType::BIGINT},
+	auto encode_scale_fn = ScalarFunction("geosilo_encode", {LogicalType::GEOMETRY(), LogicalType::BIGINT},
 	                                      LogicalType::BLOB, SiloEncodeWithScaleFunction, SiloEncodeWithScaleBind);
 	loader.RegisterFunction(encode_scale_fn);
 
 	// silo_decode(BLOB) → GEOMETRY
-	auto decode_fn = ScalarFunction("silo_decode", {LogicalType::BLOB}, LogicalType::GEOMETRY(), SiloDecodeFunction);
+	auto decode_fn = ScalarFunction("geosilo_decode", {LogicalType::BLOB}, LogicalType::GEOMETRY(), SiloDecodeFunction);
 	loader.RegisterFunction(decode_fn);
 
 	// silo_metadata(BLOB) → STRUCT{geometry_type VARCHAR, vertex_type VARCHAR, scale BIGINT}
@@ -667,7 +671,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {"vertex_type", LogicalType::VARCHAR},
 	    {"scale", LogicalType::BIGINT},
 	});
-	auto meta_fn = ScalarFunction("silo_metadata", {LogicalType::BLOB}, meta_type, SiloMetadataFunction);
+	auto meta_fn = ScalarFunction("geosilo_metadata", {LogicalType::BLOB}, meta_type, SiloMetadataFunction);
 	loader.RegisterFunction(meta_fn);
 
 	// Register "queryfarm.geosilo" Arrow extension type

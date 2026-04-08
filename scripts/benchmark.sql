@@ -59,21 +59,21 @@ SET geometry_minimum_shredding_size = -1;
 
 ATTACH '/tmp/_gs_silo_store.duckdb' AS d_silo (ROW_GROUP_SIZE 2048);
 CREATE TABLE d_silo.bg (statefp VARCHAR, countyfp VARCHAR, tractce VARCHAR, blkgrpce VARCHAR, geoid VARCHAR, geoidfq VARCHAR, namelsad VARCHAR, mtfcc VARCHAR, funcstat VARCHAR, aland BIGINT, awater BIGINT, intptlat DOUBLE, intptlon DOUBLE, geom BLOB, bbox_xmin DOUBLE, bbox_ymin DOUBLE, bbox_xmax DOUBLE, bbox_ymax DOUBLE, centroid BLOB);
-INSERT INTO d_silo.bg SELECT statefp, countyfp, tractce, blkgrpce, geoid, geoidfq, namelsad, mtfcc, funcstat, aland, awater, intptlat, intptlon, silo_encode(geom), bbox_xmin, bbox_ymin, bbox_xmax, bbox_ymax, silo_encode(centroid) FROM src.block_group;
+INSERT INTO d_silo.bg SELECT statefp, countyfp, tractce, blkgrpce, geoid, geoidfq, namelsad, mtfcc, funcstat, aland, awater, intptlat, intptlon, geosilo_encode(geom), bbox_xmin, bbox_ymin, bbox_xmax, bbox_ymax, geosilo_encode(centroid) FROM src.block_group;
 
-CREATE TABLE d_silo.zcta5 AS SELECT * EXCLUDE (geom, centroid), silo_encode(geom) AS geom, silo_encode(centroid) AS centroid FROM src.zcta5;
-CREATE TABLE d_silo.county AS SELECT * EXCLUDE (geom, centroid), silo_encode(geom) AS geom, silo_encode(centroid) AS centroid FROM src.county;
-CREATE TABLE d_silo.urban_area AS SELECT * EXCLUDE (geom, centroid), silo_encode(geom) AS geom, silo_encode(centroid) AS centroid FROM src.urban_area;
+CREATE TABLE d_silo.zcta5 AS SELECT * EXCLUDE (geom, centroid), geosilo_encode(geom) AS geom, geosilo_encode(centroid) AS centroid FROM src.zcta5;
+CREATE TABLE d_silo.county AS SELECT * EXCLUDE (geom, centroid), geosilo_encode(geom) AS geom, geosilo_encode(centroid) AS centroid FROM src.county;
+CREATE TABLE d_silo.urban_area AS SELECT * EXCLUDE (geom, centroid), geosilo_encode(geom) AS geom, geosilo_encode(centroid) AS centroid FROM src.urban_area;
 CHECKPOINT d_silo;
 
 -- Silo blob + ZSTD
 ATTACH '/tmp/_gs_silo_zstd.duckdb' AS d_silo_z (ROW_GROUP_SIZE 2048);
 CREATE TABLE d_silo_z.bg (statefp VARCHAR, countyfp VARCHAR, tractce VARCHAR, blkgrpce VARCHAR, geoid VARCHAR, geoidfq VARCHAR, namelsad VARCHAR, mtfcc VARCHAR, funcstat VARCHAR, aland BIGINT, awater BIGINT, intptlat DOUBLE, intptlon DOUBLE, geom BLOB USING COMPRESSION zstd, bbox_xmin DOUBLE, bbox_ymin DOUBLE, bbox_xmax DOUBLE, bbox_ymax DOUBLE, centroid BLOB USING COMPRESSION zstd);
-INSERT INTO d_silo_z.bg SELECT statefp, countyfp, tractce, blkgrpce, geoid, geoidfq, namelsad, mtfcc, funcstat, aland, awater, intptlat, intptlon, silo_encode(geom), bbox_xmin, bbox_ymin, bbox_xmax, bbox_ymax, silo_encode(centroid) FROM src.block_group;
+INSERT INTO d_silo_z.bg SELECT statefp, countyfp, tractce, blkgrpce, geoid, geoidfq, namelsad, mtfcc, funcstat, aland, awater, intptlat, intptlon, geosilo_encode(geom), bbox_xmin, bbox_ymin, bbox_xmax, bbox_ymax, geosilo_encode(centroid) FROM src.block_group;
 
-CREATE TABLE d_silo_z.zcta5 AS SELECT * EXCLUDE (geom, centroid), silo_encode(geom) AS geom, silo_encode(centroid) AS centroid FROM src.zcta5;
-CREATE TABLE d_silo_z.county AS SELECT * EXCLUDE (geom, centroid), silo_encode(geom) AS geom, silo_encode(centroid) AS centroid FROM src.county;
-CREATE TABLE d_silo_z.urban_area AS SELECT * EXCLUDE (geom, centroid), silo_encode(geom) AS geom, silo_encode(centroid) AS centroid FROM src.urban_area;
+CREATE TABLE d_silo_z.zcta5 AS SELECT * EXCLUDE (geom, centroid), geosilo_encode(geom) AS geom, geosilo_encode(centroid) AS centroid FROM src.zcta5;
+CREATE TABLE d_silo_z.county AS SELECT * EXCLUDE (geom, centroid), geosilo_encode(geom) AS geom, geosilo_encode(centroid) AS centroid FROM src.county;
+CREATE TABLE d_silo_z.urban_area AS SELECT * EXCLUDE (geom, centroid), geosilo_encode(geom) AS geom, geosilo_encode(centroid) AS centroid FROM src.urban_area;
 CHECKPOINT d_silo_z;
 
 -- Collect geom column block counts (each block = 256 KB max)
@@ -131,42 +131,42 @@ ORDER BY d.blocks DESC;
 -- ---------------------------------------------------------------------------
 
 CREATE TEMP TABLE raw_sizes AS
-SELECT 'block_group' AS t, count(*) AS n, sum(octet_length(ST_AsWKB(geom))) AS wkb, sum(octet_length(silo_encode(geom))) AS silo FROM src.block_group
-UNION ALL SELECT 'zcta5', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(silo_encode(geom))) FROM src.zcta5
-UNION ALL SELECT 'tract', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(silo_encode(geom))) FROM src.tract
-UNION ALL SELECT 'county', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(silo_encode(geom))) FROM src.county
-UNION ALL SELECT 'urban_area', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(silo_encode(geom))) FROM src.urban_area
-UNION ALL SELECT 'state', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(silo_encode(geom))) FROM src.state
-UNION ALL SELECT 'coastline', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(silo_encode(geom))) FROM src.coastline;
+SELECT 'block_group' AS t, count(*) AS n, sum(octet_length(ST_AsWKB(geom))) AS wkb, sum(octet_length(geosilo_encode(geom))) AS silo FROM src.block_group
+UNION ALL SELECT 'zcta5', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(geosilo_encode(geom))) FROM src.zcta5
+UNION ALL SELECT 'tract', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(geosilo_encode(geom))) FROM src.tract
+UNION ALL SELECT 'county', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(geosilo_encode(geom))) FROM src.county
+UNION ALL SELECT 'urban_area', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(geosilo_encode(geom))) FROM src.urban_area
+UNION ALL SELECT 'state', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(geosilo_encode(geom))) FROM src.state
+UNION ALL SELECT 'coastline', count(*), sum(octet_length(ST_AsWKB(geom))), sum(octet_length(geosilo_encode(geom))) FROM src.coastline;
 
 CREATE TEMP TABLE zstd_sizes (t VARCHAR, wkb_z BIGINT, silo_z BIGINT);
 
 COPY (SELECT ST_AsWKB(geom) AS g FROM src.block_group) TO '/tmp/_gs_wkb.parquet' (COMPRESSION ZSTD);
-COPY (SELECT silo_encode(geom) AS g FROM src.block_group) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
+COPY (SELECT geosilo_encode(geom) AS g FROM src.block_group) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
 INSERT INTO zstd_sizes VALUES ('block_group', (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_wkb.parquet')), (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_silo.parquet')));
 
 COPY (SELECT ST_AsWKB(geom) AS g FROM src.zcta5) TO '/tmp/_gs_wkb.parquet' (COMPRESSION ZSTD);
-COPY (SELECT silo_encode(geom) AS g FROM src.zcta5) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
+COPY (SELECT geosilo_encode(geom) AS g FROM src.zcta5) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
 INSERT INTO zstd_sizes VALUES ('zcta5', (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_wkb.parquet')), (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_silo.parquet')));
 
 COPY (SELECT ST_AsWKB(geom) AS g FROM src.tract) TO '/tmp/_gs_wkb.parquet' (COMPRESSION ZSTD);
-COPY (SELECT silo_encode(geom) AS g FROM src.tract) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
+COPY (SELECT geosilo_encode(geom) AS g FROM src.tract) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
 INSERT INTO zstd_sizes VALUES ('tract', (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_wkb.parquet')), (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_silo.parquet')));
 
 COPY (SELECT ST_AsWKB(geom) AS g FROM src.county) TO '/tmp/_gs_wkb.parquet' (COMPRESSION ZSTD);
-COPY (SELECT silo_encode(geom) AS g FROM src.county) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
+COPY (SELECT geosilo_encode(geom) AS g FROM src.county) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
 INSERT INTO zstd_sizes VALUES ('county', (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_wkb.parquet')), (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_silo.parquet')));
 
 COPY (SELECT ST_AsWKB(geom) AS g FROM src.urban_area) TO '/tmp/_gs_wkb.parquet' (COMPRESSION ZSTD);
-COPY (SELECT silo_encode(geom) AS g FROM src.urban_area) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
+COPY (SELECT geosilo_encode(geom) AS g FROM src.urban_area) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
 INSERT INTO zstd_sizes VALUES ('urban_area', (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_wkb.parquet')), (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_silo.parquet')));
 
 COPY (SELECT ST_AsWKB(geom) AS g FROM src.state) TO '/tmp/_gs_wkb.parquet' (COMPRESSION ZSTD);
-COPY (SELECT silo_encode(geom) AS g FROM src.state) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
+COPY (SELECT geosilo_encode(geom) AS g FROM src.state) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
 INSERT INTO zstd_sizes VALUES ('state', (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_wkb.parquet')), (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_silo.parquet')));
 
 COPY (SELECT ST_AsWKB(geom) AS g FROM src.coastline) TO '/tmp/_gs_wkb.parquet' (COMPRESSION ZSTD);
-COPY (SELECT silo_encode(geom) AS g FROM src.coastline) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
+COPY (SELECT geosilo_encode(geom) AS g FROM src.coastline) TO '/tmp/_gs_silo.parquet' (COMPRESSION ZSTD);
 INSERT INTO zstd_sizes VALUES ('coastline', (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_wkb.parquet')), (SELECT sum(total_compressed_size) FROM parquet_metadata('/tmp/_gs_silo.parquet')));
 
 SELECT '';

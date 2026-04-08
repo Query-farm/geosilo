@@ -16,49 +16,49 @@ LOAD spatial;
 
 # Point (use integer coords to avoid float quantization noise in ST_AsText)
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(-75 40)'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT(-75 40)'))));
 ----
 POINT (-75 40)
 
 # LineString
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 0)'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 0)'))));
 ----
 LINESTRING (0 0, 1 1, 2 0)
 
 # Polygon
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))'))));
 ----
 POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))
 
 # Polygon with hole
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (2 2, 8 2, 8 8, 2 8, 2 2))'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (2 2, 8 2, 8 8, 2 8, 2 2))'))));
 ----
 POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0), (2 2, 8 2, 8 8, 2 8, 2 2))
 
 # MultiPoint
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('MULTIPOINT(0 0, 1 1, 2 2)'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('MULTIPOINT(0 0, 1 1, 2 2)'))));
 ----
 MULTIPOINT (0 0, 1 1, 2 2)
 
 # MultiLineString
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('MULTILINESTRING((0 0, 1 1), (2 2, 3 3))'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('MULTILINESTRING((0 0, 1 1), (2 2, 3 3))'))));
 ----
 MULTILINESTRING ((0 0, 1 1), (2 2, 3 3))
 
 # MultiPolygon
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 3 2, 3 3, 2 3, 2 2)))'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 3 2, 3 3, 2 3, 2 2)))'))));
 ----
 MULTIPOLYGON (((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 3 2, 3 3, 2 3, 2 2)))
 
 # GeometryCollection
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('GEOMETRYCOLLECTION(POINT(0 0), LINESTRING(1 1, 2 2))'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('GEOMETRYCOLLECTION(POINT(0 0), LINESTRING(1 1, 2 2))'))));
 ----
 GEOMETRYCOLLECTION (POINT (0 0), LINESTRING (1 1, 2 2))
 
@@ -67,22 +67,22 @@ GEOMETRYCOLLECTION (POINT (0 0), LINESTRING (1 1, 2 2))
 # ---------------------------------------------------------------------------
 
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT EMPTY'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT EMPTY'))));
 ----
 POINT EMPTY
 
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('LINESTRING EMPTY'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('LINESTRING EMPTY'))));
 ----
 LINESTRING EMPTY
 
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POLYGON EMPTY'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POLYGON EMPTY'))));
 ----
 POLYGON EMPTY
 
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('MULTIPOLYGON EMPTY'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('MULTIPOLYGON EMPTY'))));
 ----
 MULTIPOLYGON EMPTY
 
@@ -91,12 +91,12 @@ MULTIPOLYGON EMPTY
 # ---------------------------------------------------------------------------
 
 query I
-SELECT silo_encode(NULL::GEOMETRY);
+SELECT geosilo_encode(NULL::GEOMETRY);
 ----
 NULL
 
 query I
-SELECT silo_decode(NULL::BLOB);
+SELECT geosilo_decode(NULL::BLOB);
 ----
 NULL
 
@@ -106,13 +106,13 @@ NULL
 
 # Roundtrip with custom scale (projected CRS in meters)
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(500000 4500000)'), 100)));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT(500000 4500000)'), 100)));
 ----
 POINT (500000 4500000)
 
 # Different scales produce different blobs
 query I
-SELECT silo_encode(ST_GeomFromText('POINT(1 1)'), 100) != silo_encode(ST_GeomFromText('POINT(1 1)'), 10000000);
+SELECT geosilo_encode(ST_GeomFromText('POINT(1 1)'), 100) != geosilo_encode(ST_GeomFromText('POINT(1 1)'), 10000000);
 ----
 true
 
@@ -122,7 +122,7 @@ true
 
 # Silo blob should be smaller than WKB for polygons
 query I
-SELECT octet_length(silo_encode(geom)) < octet_length(ST_AsWKB(geom))
+SELECT octet_length(geosilo_encode(geom)) < octet_length(ST_AsWKB(geom))
 FROM (SELECT ST_GeomFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))') AS geom);
 ----
 true
@@ -133,13 +133,13 @@ true
 
 # Coordinate that overflows int32 at default scale 1e7 should error
 statement error
-SELECT silo_encode(ST_GeomFromText('POINT(300 0)'));
+SELECT geosilo_encode(ST_GeomFromText('POINT(300 0)'));
 ----
 GeoSilo: coordinate 300.0000000 overflows int32 at scale 10000000
 
 # Same coordinate works with a smaller scale
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(300 0)'), 100)));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT(300 0)'), 100)));
 ----
 POINT (300 0)
 
@@ -149,7 +149,7 @@ POINT (300 0)
 
 # Two points far apart — delta won't fit int16, uses escape path
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('LINESTRING(-180 -90, 180 90)'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('LINESTRING(-180 -90, 180 90)'))));
 ----
 LINESTRING (-180 -90, 180 90)
 
@@ -159,7 +159,7 @@ LINESTRING (-180 -90, 180 90)
 
 query I
 SELECT count(*) FROM (
-    SELECT silo_decode(silo_encode(geom)) AS decoded FROM (
+    SELECT geosilo_decode(geosilo_encode(geom)) AS decoded FROM (
         VALUES
             (ST_GeomFromText('POINT(0 0)')),
             (ST_GeomFromText('LINESTRING(0 0, 1 1)')),
@@ -167,75 +167,75 @@ SELECT count(*) FROM (
             (ST_GeomFromText('MULTIPOINT(0 0, 1 1)')),
             (ST_GeomFromText('MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)))'))
     ) AS t(geom)
-    WHERE ST_GeometryType(silo_decode(silo_encode(geom))) = ST_GeometryType(geom)
+    WHERE ST_GeometryType(geosilo_decode(geosilo_encode(geom))) = ST_GeometryType(geom)
 );
 ----
 5
 
 # ---------------------------------------------------------------------------
-# silo_metadata
+# geosilo_metadata
 # ---------------------------------------------------------------------------
 
 query III
 SELECT m.geometry_type, m.vertex_type, m.scale
-FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('POINT(1 2)'))) AS m);
+FROM (SELECT geosilo_metadata(geosilo_encode(ST_GeomFromText('POINT(1 2)'))) AS m);
 ----
 POINT	XY	10000000
 
 query III
 SELECT m.geometry_type, m.vertex_type, m.scale
-FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)))'))) AS m);
+FROM (SELECT geosilo_metadata(geosilo_encode(ST_GeomFromText('MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)))'))) AS m);
 ----
 MULTIPOLYGON	XY	10000000
 
 query III
 SELECT m.geometry_type, m.vertex_type, m.scale
-FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1)'), 100)) AS m);
+FROM (SELECT geosilo_metadata(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1)'), 100)) AS m);
 ----
 LINESTRING	XY	100
 
 query I
-SELECT silo_metadata(NULL::BLOB);
+SELECT geosilo_metadata(NULL::BLOB);
 ----
 NULL
 
 # ---------------------------------------------------------------------------
-# silo_metadata — all geometry types
+# geosilo_metadata — all geometry types
 # ---------------------------------------------------------------------------
 
 query III
 SELECT m.geometry_type, m.vertex_type, m.scale
-FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('LINESTRING EMPTY'))) AS m);
+FROM (SELECT geosilo_metadata(geosilo_encode(ST_GeomFromText('LINESTRING EMPTY'))) AS m);
 ----
 LINESTRING	XY	10000000
 
 query III
 SELECT m.geometry_type, m.vertex_type, m.scale
-FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 0))'))) AS m);
+FROM (SELECT geosilo_metadata(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 0))'))) AS m);
 ----
 POLYGON	XY	10000000
 
 query III
 SELECT m.geometry_type, m.vertex_type, m.scale
-FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('MULTIPOINT(0 0, 1 1)'))) AS m);
+FROM (SELECT geosilo_metadata(geosilo_encode(ST_GeomFromText('MULTIPOINT(0 0, 1 1)'))) AS m);
 ----
 MULTIPOINT	XY	10000000
 
 query III
 SELECT m.geometry_type, m.vertex_type, m.scale
-FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('MULTILINESTRING((0 0, 1 1), (2 2, 3 3))'))) AS m);
+FROM (SELECT geosilo_metadata(geosilo_encode(ST_GeomFromText('MULTILINESTRING((0 0, 1 1), (2 2, 3 3))'))) AS m);
 ----
 MULTILINESTRING	XY	10000000
 
 query III
 SELECT m.geometry_type, m.vertex_type, m.scale
-FROM (SELECT silo_metadata(silo_encode(ST_GeomFromText('GEOMETRYCOLLECTION(POINT(0 0))'))) AS m);
+FROM (SELECT geosilo_metadata(geosilo_encode(ST_GeomFromText('GEOMETRYCOLLECTION(POINT(0 0))'))) AS m);
 ----
 GEOMETRYCOLLECTION	XY	10000000
 
-# silo_metadata on invalid blob
+# geosilo_metadata on invalid blob
 statement error
-SELECT silo_metadata('\x00\x01\x02\x03'::BLOB);
+SELECT geosilo_metadata('\x00\x01\x02\x03'::BLOB);
 ----
 GeoSilo: invalid blob
 
@@ -244,17 +244,17 @@ GeoSilo: invalid blob
 # ---------------------------------------------------------------------------
 
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('MULTIPOINT EMPTY'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('MULTIPOINT EMPTY'))));
 ----
 MULTIPOINT EMPTY
 
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('MULTILINESTRING EMPTY'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('MULTILINESTRING EMPTY'))));
 ----
 MULTILINESTRING EMPTY
 
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('GEOMETRYCOLLECTION EMPTY'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('GEOMETRYCOLLECTION EMPTY'))));
 ----
 GEOMETRYCOLLECTION EMPTY
 
@@ -263,12 +263,12 @@ GEOMETRYCOLLECTION EMPTY
 # ---------------------------------------------------------------------------
 
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(-180 -90)'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT(-180 -90)'))));
 ----
 POINT (-180 -90)
 
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('LINESTRING(-180 -90, -170 -80, -160 -70)'))));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('LINESTRING(-180 -90, -170 -80, -160 -70)'))));
 ----
 LINESTRING (-180 -90, -170 -80, -160 -70)
 
@@ -278,7 +278,7 @@ LINESTRING (-180 -90, -170 -80, -160 -70)
 
 # Generate a linestring with 100 points: (0,0), (1,0), (2,0), ..., (99,0)
 query I
-SELECT ST_NPoints(silo_decode(silo_encode(
+SELECT ST_NPoints(geosilo_decode(geosilo_encode(
     ST_MakeLine(list(ST_Point(i, 0)))
 ))) FROM range(100) t(i);
 ----
@@ -288,7 +288,7 @@ SELECT ST_NPoints(silo_decode(silo_encode(
 query II
 SELECT ST_X(ST_PointN(decoded, 1)), ST_X(ST_PointN(decoded, 100))
 FROM (
-    SELECT silo_decode(silo_encode(
+    SELECT geosilo_decode(geosilo_encode(
         ST_MakeLine(list(ST_Point(i, 0)))
     )) AS decoded FROM range(100) t(i)
 );
@@ -303,8 +303,8 @@ FROM (
 # Nearby points: deltas fit in int16 (2 bytes each)
 # Far points: deltas need int32 escape (6 bytes each)
 query I
-SELECT octet_length(silo_encode(ST_GeomFromText('LINESTRING(0 0, 0.001 0.001, 0.002 0.002)')))
-     < octet_length(silo_encode(ST_GeomFromText('LINESTRING(0 0, 100 100, -100 -100)')));
+SELECT octet_length(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 0.001 0.001, 0.002 0.002)')))
+     < octet_length(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 100 100, -100 -100)')));
 ----
 true
 
@@ -314,7 +314,7 @@ true
 
 query I
 SELECT count(*) FROM (
-    SELECT silo_decode(silo_encode(ST_Point(i * 0.01, i * 0.02))) AS geom
+    SELECT geosilo_decode(geosilo_encode(ST_Point(i * 0.01, i * 0.02))) AS geom
     FROM range(1000) t(i)
 ) WHERE round(ST_X(geom), 2) = round(ST_Y(geom) / 2, 2);
 ----
@@ -326,7 +326,7 @@ SELECT count(*) FROM (
 
 query I
 SELECT count(*) FROM (
-    SELECT silo_decode(silo_encode(CASE WHEN i % 3 = 0 THEN NULL ELSE ST_Point(i, i) END)) AS geom
+    SELECT geosilo_decode(geosilo_encode(CASE WHEN i % 3 = 0 THEN NULL ELSE ST_Point(i, i) END)) AS geom
     FROM range(9) t(i)
 ) WHERE geom IS NULL;
 ----
@@ -334,18 +334,18 @@ SELECT count(*) FROM (
 
 query I
 SELECT count(*) FROM (
-    SELECT silo_decode(silo_encode(CASE WHEN i % 3 = 0 THEN NULL ELSE ST_Point(i, i) END)) AS geom
+    SELECT geosilo_decode(geosilo_encode(CASE WHEN i % 3 = 0 THEN NULL ELSE ST_Point(i, i) END)) AS geom
     FROM range(9) t(i)
 ) WHERE geom IS NOT NULL;
 ----
 6
 
 # ---------------------------------------------------------------------------
-# silo_metadata NULL in batch
+# geosilo_metadata NULL in batch
 # ---------------------------------------------------------------------------
 
 query I
-SELECT silo_metadata(NULL::BLOB) IS NULL;
+SELECT geosilo_metadata(NULL::BLOB) IS NULL;
 ----
 true
 
@@ -355,19 +355,19 @@ true
 
 # Random blob should fail with magic byte error
 statement error
-SELECT silo_decode('\x00\x01\x02\x03'::BLOB);
+SELECT geosilo_decode('\x00\x01\x02\x03'::BLOB);
 ----
 GeoSilo: invalid magic byte
 
 # Truncated blob
 statement error
-SELECT silo_decode('\x47\x01'::BLOB);
+SELECT geosilo_decode('\x47\x01'::BLOB);
 ----
 GeoSilo: unexpected end of blob
 
 # Wrong version byte
 statement error
-SELECT silo_decode('\x47\xFF\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB);
+SELECT geosilo_decode('\x47\xFF\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB);
 ----
 GeoSilo: unsupported version
 
@@ -380,7 +380,7 @@ statement ok
 CREATE TABLE t_wgs AS SELECT ST_SetCRS(ST_GeomFromText('POINT(1 2)'), 'EPSG:4326') AS geom;
 
 query I
-SELECT (silo_metadata(silo_encode(geom))).scale FROM t_wgs;
+SELECT (geosilo_metadata(geosilo_encode(geom))).scale FROM t_wgs;
 ----
 10000000
 
@@ -389,19 +389,19 @@ statement ok
 CREATE TABLE t_utm AS SELECT ST_SetCRS(ST_GeomFromText('POINT(500000 4500000)'), 'EPSG:32618') AS geom;
 
 query I
-SELECT (silo_metadata(silo_encode(geom))).scale FROM t_utm;
+SELECT (geosilo_metadata(geosilo_encode(geom))).scale FROM t_utm;
 ----
 100
 
 # UTM roundtrip — auto-detected scale
 query I
-SELECT ST_AsText(silo_decode(silo_encode(geom))) FROM t_utm;
+SELECT ST_AsText(geosilo_decode(geosilo_encode(geom))) FROM t_utm;
 ----
 POINT (500000 4500000)
 
 # No CRS → default scale 1e7
 query I
-SELECT (silo_metadata(silo_encode(ST_GeomFromText('POINT(1 2)')))).scale;
+SELECT (geosilo_metadata(geosilo_encode(ST_GeomFromText('POINT(1 2)')))).scale;
 ----
 10000000
 
@@ -411,19 +411,19 @@ SELECT (silo_metadata(silo_encode(ST_GeomFromText('POINT(1 2)')))).scale;
 
 # Explicit scale 30 (US survey feet)
 query I
-SELECT (silo_metadata(silo_encode(ST_GeomFromText('POINT(1000000 500000)'), 30))).scale;
+SELECT (geosilo_metadata(geosilo_encode(ST_GeomFromText('POINT(1000000 500000)'), 30))).scale;
 ----
 30
 
 # Explicit scale roundtrip
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(500000 4500000)'), 100)));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT(500000 4500000)'), 100)));
 ----
 POINT (500000 4500000)
 
 # Different scales produce different quantization
 query I
-SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(1.23456789 2.34567891)'), 100)))
-    != ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(1.23456789 2.34567891)'), 10000000)));
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT(1.23456789 2.34567891)'), 100)))
+    != ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT(1.23456789 2.34567891)'), 10000000)));
 ----
 true

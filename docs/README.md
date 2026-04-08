@@ -7,13 +7,13 @@ INSTALL spatial; LOAD spatial;
 INSTALL geosilo FROM community; LOAD geosilo;
 
 -- Encode: GEOMETRY → compact BLOB
-SELECT silo_encode(geom) FROM my_table;
+SELECT geosilo_encode(geom) FROM my_table;
 
 -- Decode: compact BLOB → GEOMETRY
-SELECT ST_Area(silo_decode(geom)) FROM compact_table;
+SELECT ST_Area(geosilo_decode(geom)) FROM compact_table;
 
 -- Inspect without decoding
-SELECT silo_metadata(geom) FROM compact_table;
+SELECT geosilo_metadata(geom) FROM compact_table;
 -- {'geometry_type': MULTIPOLYGON, 'vertex_type': XY, 'scale': 10000000}
 ```
 
@@ -34,10 +34,10 @@ The result is ~70% smaller raw blobs that compress 3-4x better with ZSTD because
 
 | Function | Input | Output | Description |
 |---|---|---|---|
-| `silo_encode(geom)` | GEOMETRY | BLOB | Encode with auto-detected or default scale |
-| `silo_encode(geom, scale)` | GEOMETRY, BIGINT | BLOB | Encode with explicit scale |
-| `silo_decode(blob)` | BLOB | GEOMETRY | Decode back to GEOMETRY |
-| `silo_metadata(blob)` | BLOB | STRUCT | Read header without decoding |
+| `geosilo_encode(geom)` | GEOMETRY | BLOB | Encode with auto-detected or default scale |
+| `geosilo_encode(geom, scale)` | GEOMETRY, BIGINT | BLOB | Encode with explicit scale |
+| `geosilo_decode(blob)` | BLOB | GEOMETRY | Decode back to GEOMETRY |
+| `geosilo_metadata(blob)` | BLOB | STRUCT | Read header without decoding |
 
 All geometry types are supported: Point, LineString, Polygon, Multi\*, GeometryCollection, and empty geometries.
 
@@ -53,7 +53,7 @@ The scale factor controls coordinate precision. It is stored in each blob header
 When the GEOMETRY column carries a CRS (e.g., `GEOMETRY(EPSG:4326)`), the scale is auto-detected. An explicit scale parameter always overrides:
 
 ```sql
-SELECT silo_encode(geom, 100) FROM my_utm_table;
+SELECT geosilo_encode(geom, 100) FROM my_utm_table;
 ```
 
 ## Benchmarks
@@ -79,7 +79,7 @@ INSTALL spatial; LOAD spatial;
 INSTALL geosilo FROM community; LOAD geosilo;
 
 -- Roundtrip
-SELECT ST_AsText(silo_decode(silo_encode(
+SELECT ST_AsText(geosilo_decode(geosilo_encode(
     ST_GeomFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))')
 )));
 -- POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))
@@ -99,17 +99,17 @@ CREATE TABLE compact (
 );
 
 INSERT INTO compact
-SELECT id, silo_encode(geom) FROM source_table;
+SELECT id, geosilo_encode(geom) FROM source_table;
 
 -- Decode for spatial operations
-SELECT ST_Area(silo_decode(geom)) FROM compact;
+SELECT ST_Area(geosilo_decode(geom)) FROM compact;
 ```
 
 Without `storage_compatibility_version='latest'`, `USING COMPRESSION zstd` is silently ignored.
 
 ### Arrow IPC transport
 
-GeoSilo registers an [Arrow extension type](https://arrow.apache.org/docs/format/Columnar.html#extension-types) named `queryfarm.geosilo`. When an Arrow column carries this metadata, DuckDB (with geosilo loaded) automatically decodes silo blobs to GEOMETRY on read and encodes GEOMETRY to silo blobs on write — no explicit `silo_decode` needed.
+GeoSilo registers an [Arrow extension type](https://arrow.apache.org/docs/format/Columnar.html#extension-types) named `queryfarm.geosilo`. When an Arrow column carries this metadata, DuckDB (with geosilo loaded) automatically decodes silo blobs to GEOMETRY on read and encodes GEOMETRY to silo blobs on write — no explicit `geosilo_decode` needed.
 
 CRS is preserved through the Arrow metadata. The extension metadata JSON carries `{"crs": "EPSG:4326"}` (or similar), which is attached to the GEOMETRY type on decode and used to auto-detect scale on encode.
 
