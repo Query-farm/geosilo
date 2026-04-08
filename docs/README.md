@@ -58,6 +58,8 @@ SELECT geosilo_encode(geom, 100) FROM my_utm_table;
 
 ## Benchmarks
 
+### Compression
+
 Geometry column compression vs standard WKB on US Census TIGER/Line 2025 (WGS84):
 
 | Table | Rows | WKB Size | GeoSilo | GeoSilo + ZSTD |
@@ -69,6 +71,30 @@ Geometry column compression vs standard WKB on US Census TIGER/Line 2025 (WGS84)
 | urban_area | 2,644 | 23 MB | 0.29x | 0.26x |
 
 Reproduce with: `./build/release/duckdb -f scripts/benchmark.sql` (requires `tiger.duckdb` in the working directory).
+
+### Performance
+
+Encode/decode throughput on US Census TIGER/Line 2025 (single-threaded, Apple M-series):
+
+| Table | Rows | Encode | Decode |
+|---|---|---|---|
+| block_group | 242,748 | 75 ms (2,789 MB/s) | 71 ms (2,946 MB/s) |
+| zcta5 | 33,791 | 49 ms (3,673 MB/s) | 47 ms (3,830 MB/s) |
+| tract | 85,529 | 41 ms (3,039 MB/s) | 39 ms (3,195 MB/s) |
+| county | 3,235 | 7 ms (3,514 MB/s) | 7 ms (3,514 MB/s) |
+
+Throughput is measured relative to WKB input/output size. GeoSilo reads and writes DuckDB's internal GEOMETRY format directly — no intermediate WKB serialization step.
+
+End-to-end overhead for spatial operations (decode + compute vs raw compute):
+
+| Table | Rows | Raw ST_Area | Decode + ST_Area | Overhead |
+|---|---|---|---|---|
+| block_group | 242,748 | 18 ms | 83 ms | +361% |
+| county | 3,235 | 2 ms | 8 ms | +300% |
+
+The overhead is from the decode step, not from precision loss. For I/O-bound workloads (reading from disk or network), the 3–4x smaller data size more than compensates for the decode cost.
+
+Reproduce with: `./build/release/duckdb -f scripts/throughput_benchmark.sql`
 
 ## Usage
 

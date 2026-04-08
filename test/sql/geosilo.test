@@ -353,17 +353,17 @@ true
 # Invalid input
 # ---------------------------------------------------------------------------
 
-# Random blob should fail with magic byte error
+# Random blob (too small) should fail
 statement error
 SELECT geosilo_decode('\x00\x01\x02\x03'::BLOB);
 ----
-GeoSilo: invalid magic byte
+GeoSilo: blob too small
 
-# Truncated blob
+# Truncated blob (too small for header)
 statement error
 SELECT geosilo_decode('\x47\x01'::BLOB);
 ----
-GeoSilo: unexpected end of blob
+GeoSilo: blob too small
 
 # Wrong version byte
 statement error

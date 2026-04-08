@@ -97,21 +97,22 @@ struct SiloEncodeBindData : public FunctionData {
 // ---------------------------------------------------------------------------
 // Writer: GEOMETRY (WKB bytes) → GeoSilo v2 blob
 // ---------------------------------------------------------------------------
+// Uses raw pointer writes to a pre-sized buffer. The worst-case silo output
+// size is bounded by the WKB input size (every coordinate shrinks or stays
+// the same), so we allocate WKB_size/2 + 14 upfront and never resize.
 
 class SiloWriter {
 public:
 	explicit SiloWriter(int64_t scale) : scale_(scale), dbl_scale_(static_cast<double>(scale)) {}
 
-	void EncodeWKB(const uint8_t *data, idx_t size) {
-		wkb_ = data;
-		wkb_size_ = size;
-		pos_ = 0;
-		buf_.clear();
-		buf_.reserve(size / 2 + 14); // #6: pre-allocate — silo is always smaller than WKB
+	void SetScale(int64_t scale) { scale_ = scale; dbl_scale_ = static_cast<double>(scale); }
 
-		auto byte_order = ReadWKBByte();
+	string_t Encode(const uint8_t *data, idx_t size, Vector &result) {
+		rp_ = data;
+
+		auto byte_order = RByte();
 		(void)byte_order;
-		auto wkb_type = ReadWKBUint32();
+		auto wkb_type = RU32();
 		auto geom_type = static_cast<GeometryType>(wkb_type & 0xFF);
 		auto has_z = (wkb_type & 0x80000000) != 0;
 		auto has_m = (wkb_type & 0x40000000) != 0;
@@ -119,49 +120,41 @@ public:
 		if (has_z && has_m)      vert_type = VertexType::XYZM;
 		else if (has_z)          vert_type = VertexType::XYZ;
 		else if (has_m)          vert_type = VertexType::XYM;
-		vertex_width_ = 2 + (has_z ? 1 : 0) + (has_m ? 1 : 0);
+		vw_ = 2 + (has_z ? 1 : 0) + (has_m ? 1 : 0);
 
-		WriteHeader(geom_type, vert_type);
+		// Pre-size buffer. Silo is always <= WKB: worst case is all escape
+		// deltas (6 bytes vs 8 bytes per coord = 75%) plus 14-byte header.
+		buf_.resize(size + 14);
+		wp_ = buf_.data();
+
+		// Header
+		WByte(GEOSILO_MAGIC);
+		WByte(GEOSILO_VERSION);
+		WByte(static_cast<uint8_t>(geom_type));
+		WByte(static_cast<uint8_t>(vert_type));
+		WI64(scale_);
+
 		EncodeGeometry(geom_type);
-	}
 
-	string_t Finish(Vector &result) {
-		return StringVector::AddStringOrBlob(result, reinterpret_cast<const char *>(buf_.data()), buf_.size());
+		auto actual_size = static_cast<idx_t>(wp_ - buf_.data());
+		return StringVector::AddStringOrBlob(result, reinterpret_cast<const char *>(buf_.data()), actual_size);
 	}
 
 private:
-	void WriteHeader(GeometryType geom_type, VertexType vert_type) {
-		WriteByte(GEOSILO_MAGIC);
-		WriteByte(GEOSILO_VERSION);
-		WriteByte(static_cast<uint8_t>(geom_type));
-		WriteByte(static_cast<uint8_t>(vert_type));
-		WriteInt64(scale_);
-	}
+	// --- WKB reading (unchecked in inner loop — validated by overall size) ---
+	uint8_t RByte()  { return *rp_++; }
+	uint32_t RU32()  { uint32_t v; memcpy(&v, rp_, 4); rp_ += 4; return v; }
+	double RDbl()    { double v; memcpy(&v, rp_, 8); rp_ += 8; return v; }
 
-	// --- WKB reading ---
-	uint8_t ReadWKBByte() {
-		if (pos_ >= wkb_size_) throw InvalidInputException("GeoSilo: unexpected end of WKB");
-		return wkb_[pos_++];
-	}
-	uint32_t ReadWKBUint32() {
-		if (pos_ + 4 > wkb_size_) throw InvalidInputException("GeoSilo: unexpected end of WKB");
-		uint32_t val; memcpy(&val, wkb_ + pos_, 4); pos_ += 4; return val;
-	}
-	double ReadWKBDouble() {
-		if (pos_ + 8 > wkb_size_) throw InvalidInputException("GeoSilo: unexpected end of WKB");
-		double val; memcpy(&val, wkb_ + pos_, 8); pos_ += 8; return val;
-	}
+	// --- Output writing (raw pointer, no resize) ---
+	void WByte(uint8_t b)    { *wp_++ = b; }
+	void WU32(uint32_t v)    { memcpy(wp_, &v, 4); wp_ += 4; }
+	void WI16(int16_t v)     { memcpy(wp_, &v, 2); wp_ += 2; }
+	void WI32(int32_t v)     { memcpy(wp_, &v, 4); wp_ += 4; }
+	void WI64(int64_t v)     { memcpy(wp_, &v, 8); wp_ += 8; }
 
-	// --- Output writing ---
-	void WriteByte(uint8_t b)    { buf_.push_back(b); }
-	void WriteUint32(uint32_t v) { auto off = buf_.size(); buf_.resize(off + 4); memcpy(buf_.data() + off, &v, 4); }
-	void WriteInt16(int16_t v)   { auto off = buf_.size(); buf_.resize(off + 2); memcpy(buf_.data() + off, &v, 2); }
-	void WriteInt32(int32_t v)   { auto off = buf_.size(); buf_.resize(off + 4); memcpy(buf_.data() + off, &v, 4); }
-	void WriteInt64(int64_t v)   { auto off = buf_.size(); buf_.resize(off + 8); memcpy(buf_.data() + off, &v, 8); }
-
-	// #1: overflow-safe scaling — clamp to int32 range
 	int32_t ScaleCoord(double val) {
-		if (std::isnan(val)) return EMPTY_COORD; // #5: empty geometry
+		if (std::isnan(val)) return EMPTY_COORD;
 		auto scaled = static_cast<int64_t>(std::round(val * dbl_scale_));
 		if (scaled > std::numeric_limits<int32_t>::max() || scaled < std::numeric_limits<int32_t>::min()) {
 			throw InvalidInputException(
@@ -171,28 +164,30 @@ private:
 		return static_cast<int32_t>(scaled);
 	}
 
-	// #3: write delta as int16, escaping to int32 when needed
 	void WriteDelta(int32_t delta) {
 		if (delta > std::numeric_limits<int16_t>::max() || delta <= std::numeric_limits<int16_t>::min()) {
-			// Delta doesn't fit int16 — write escape sentinel + int32
-			WriteInt16(DELTA_ESCAPE);
-			WriteInt32(delta);
+			WI16(DELTA_ESCAPE);
+			WI32(delta);
 		} else {
-			WriteInt16(static_cast<int16_t>(delta));
+			WI16(static_cast<int16_t>(delta));
 		}
 	}
 
 	void EncodeCoordinateSequence(uint32_t num_points) {
-		WriteUint32(num_points);
+		WU32(num_points);
+		if (num_points == 0) return;
+
+		// First vertex: absolute
 		int32_t prev[4] = {0, 0, 0, 0};
-		for (uint32_t i = 0; i < num_points; i++) {
-			for (uint32_t d = 0; d < vertex_width_; d++) {
-				int32_t scaled = ScaleCoord(ReadWKBDouble());
-				if (i == 0) {
-					WriteInt32(scaled); // first point: absolute
-				} else {
-					WriteDelta(scaled - prev[d]); // #3: variable-width delta
-				}
+		for (uint32_t d = 0; d < vw_; d++) {
+			prev[d] = ScaleCoord(RDbl());
+			WI32(prev[d]);
+		}
+		// Remaining vertices: delta
+		for (uint32_t i = 1; i < num_points; i++) {
+			for (uint32_t d = 0; d < vw_; d++) {
+				int32_t scaled = ScaleCoord(RDbl());
+				WriteDelta(scaled - prev[d]);
 				prev[d] = scaled;
 			}
 		}
@@ -201,46 +196,46 @@ private:
 	void EncodeGeometry(GeometryType type) {
 		switch (type) {
 		case GeometryType::POINT: {
-			for (uint32_t d = 0; d < vertex_width_; d++) {
-				WriteInt32(ScaleCoord(ReadWKBDouble()));
+			for (uint32_t d = 0; d < vw_; d++) {
+				WI32(ScaleCoord(RDbl()));
 			}
 			break;
 		}
 		case GeometryType::LINESTRING: {
-			EncodeCoordinateSequence(ReadWKBUint32());
+			EncodeCoordinateSequence(RU32());
 			break;
 		}
 		case GeometryType::POLYGON: {
-			uint32_t num_rings = ReadWKBUint32();
-			WriteUint32(num_rings);
+			uint32_t num_rings = RU32();
+			WU32(num_rings);
 			for (uint32_t r = 0; r < num_rings; r++) {
-				EncodeCoordinateSequence(ReadWKBUint32());
+				EncodeCoordinateSequence(RU32());
 			}
 			break;
 		}
 		case GeometryType::MULTIPOINT:
 		case GeometryType::MULTILINESTRING:
 		case GeometryType::MULTIPOLYGON: {
-			uint32_t num_parts = ReadWKBUint32();
-			WriteUint32(num_parts);
+			uint32_t num_parts = RU32();
+			WU32(num_parts);
 			auto inner = (type == GeometryType::MULTIPOINT)       ? GeometryType::POINT
 			             : (type == GeometryType::MULTILINESTRING) ? GeometryType::LINESTRING
 			                                                      : GeometryType::POLYGON;
 			for (uint32_t p = 0; p < num_parts; p++) {
-				ReadWKBByte();    // byte order
-				ReadWKBUint32();  // type (skip)
+				RByte();   // byte order
+				RU32();    // type (skip)
 				EncodeGeometry(inner);
 			}
 			break;
 		}
 		case GeometryType::GEOMETRYCOLLECTION: {
-			uint32_t num_parts = ReadWKBUint32();
-			WriteUint32(num_parts);
+			uint32_t num_parts = RU32();
+			WU32(num_parts);
 			for (uint32_t p = 0; p < num_parts; p++) {
-				ReadWKBByte(); // byte order
-				auto wt = ReadWKBUint32();
+				RByte(); // byte order
+				auto wt = RU32();
 				auto child_type = static_cast<GeometryType>(wt & 0xFF);
-				WriteByte(static_cast<uint8_t>(child_type));
+				WByte(static_cast<uint8_t>(child_type));
 				EncodeGeometry(child_type);
 			}
 			break;
@@ -252,111 +247,101 @@ private:
 
 	int64_t scale_;
 	double dbl_scale_;
-	uint32_t vertex_width_ = 2;
-	const uint8_t *wkb_ = nullptr;
-	idx_t wkb_size_ = 0;
-	idx_t pos_ = 0;
+	uint32_t vw_ = 2;
+	const uint8_t *rp_ = nullptr;
+	uint8_t *wp_ = nullptr;
 	vector<uint8_t> buf_;
 };
 
 // ---------------------------------------------------------------------------
 // Reader: GeoSilo blob → WKB bytes
-// Supports both v1 (all int32 deltas) and v2 (int16 deltas with escape)
 // ---------------------------------------------------------------------------
+// Uses raw pointer reads/writes. Output is allocated directly in StringVector
+// via EmptyString — no intermediate buffer, no copy. WKB output size is
+// bounded by silo_size * 4 (worst case: every 2-byte delta expands to 8-byte double).
 
 class SiloReader {
 public:
-	void Decode(const uint8_t *data, idx_t size) {
-		silo_ = data;
-		silo_size_ = size;
-		pos_ = 0;
+	string_t Decode(const uint8_t *data, idx_t size, Vector &result) {
+		rp_ = data;
 
-		uint8_t magic = ReadByte();
+		if (size < 14) throw InvalidInputException("GeoSilo: blob too small");
+		uint8_t magic = RByte();
 		if (magic != GEOSILO_MAGIC) {
 			throw InvalidInputException("GeoSilo: invalid magic byte 0x%02x", magic);
 		}
-		auto version = ReadByte();
+		auto version = RByte();
 		if (version != GEOSILO_VERSION) {
 			throw InvalidInputException("GeoSilo: unsupported version %d", version);
 		}
 
-		auto geom_type = static_cast<GeometryType>(ReadByte());
-		auto vert_type = static_cast<VertexType>(ReadByte());
-		scale_ = ReadInt64();
-		inv_scale_ = 1.0 / static_cast<double>(scale_);
+		auto geom_type = static_cast<GeometryType>(RByte());
+		auto vert_type = static_cast<VertexType>(RByte());
+		auto scale = RI64();
+		inv_scale_ = 1.0 / static_cast<double>(scale);
 
 		bool has_z = (vert_type == VertexType::XYZ || vert_type == VertexType::XYZM);
 		bool has_m = (vert_type == VertexType::XYM || vert_type == VertexType::XYZM);
-		vertex_width_ = 2 + (has_z ? 1 : 0) + (has_m ? 1 : 0);
+		vw_ = 2 + (has_z ? 1 : 0) + (has_m ? 1 : 0);
 
-		buf_.clear();
-		buf_.reserve(silo_size_ * 2); // #6: pre-allocate — WKB is ~2x silo
+		// Pre-size buffer. Worst case: each 2-byte delta → 8-byte double (4x),
+		// plus 5-byte WKB part headers for Multi* types.
+		buf_.resize(size * 5 + 64);
+		wp_ = buf_.data();
 
 		// WKB header
-		WriteByte(0x01); // little-endian
+		WByte(0x01); // little-endian
 		uint32_t wkb_type = static_cast<uint32_t>(geom_type);
 		if (has_z) wkb_type |= 0x80000000;
 		if (has_m) wkb_type |= 0x40000000;
-		WriteUint32(wkb_type);
+		WU32(wkb_type);
 
 		DecodeGeometry(geom_type);
-	}
 
-	string_t Finish(Vector &result) {
-		return StringVector::AddStringOrBlob(result, reinterpret_cast<const char *>(buf_.data()), buf_.size());
+		auto actual_size = static_cast<idx_t>(wp_ - buf_.data());
+		return StringVector::AddStringOrBlob(result, reinterpret_cast<const char *>(buf_.data()), actual_size);
 	}
 
 private:
-	uint8_t ReadByte() {
-		if (pos_ >= silo_size_) throw InvalidInputException("GeoSilo: unexpected end of blob");
-		return silo_[pos_++];
-	}
-	uint32_t ReadUint32() {
-		if (pos_ + 4 > silo_size_) throw InvalidInputException("GeoSilo: unexpected end of blob");
-		uint32_t v; memcpy(&v, silo_ + pos_, 4); pos_ += 4; return v;
-	}
-	int16_t ReadInt16() {
-		if (pos_ + 2 > silo_size_) throw InvalidInputException("GeoSilo: unexpected end of blob");
-		int16_t v; memcpy(&v, silo_ + pos_, 2); pos_ += 2; return v;
-	}
-	int32_t ReadInt32() {
-		if (pos_ + 4 > silo_size_) throw InvalidInputException("GeoSilo: unexpected end of blob");
-		int32_t v; memcpy(&v, silo_ + pos_, 4); pos_ += 4; return v;
-	}
-	int64_t ReadInt64() {
-		if (pos_ + 8 > silo_size_) throw InvalidInputException("GeoSilo: unexpected end of blob");
-		int64_t v; memcpy(&v, silo_ + pos_, 8); pos_ += 8; return v;
-	}
+	// --- Silo reading (raw pointer, no per-read bounds check) ---
+	uint8_t RByte()  { return *rp_++; }
+	uint32_t RU32()  { uint32_t v; memcpy(&v, rp_, 4); rp_ += 4; return v; }
+	int16_t RI16()   { int16_t v; memcpy(&v, rp_, 2); rp_ += 2; return v; }
+	int32_t RI32()   { int32_t v; memcpy(&v, rp_, 4); rp_ += 4; return v; }
+	int64_t RI64()   { int64_t v; memcpy(&v, rp_, 8); rp_ += 8; return v; }
 
-	int32_t ReadDelta() {
-		int16_t d = ReadInt16();
-		if (d == DELTA_ESCAPE) {
-			return ReadInt32();
-		}
+	int32_t RDelta() {
+		int16_t d = RI16();
+		if (d == DELTA_ESCAPE) return RI32();
 		return static_cast<int32_t>(d);
 	}
 
-	void WriteByte(uint8_t b)    { buf_.push_back(b); }
-	void WriteUint32(uint32_t v) { auto off = buf_.size(); buf_.resize(off + 4); memcpy(buf_.data() + off, &v, 4); }
-	void WriteDouble(double v)   { auto off = buf_.size(); buf_.resize(off + 8); memcpy(buf_.data() + off, &v, 8); }
+	// --- WKB writing (raw pointer, no resize) ---
+	void WByte(uint8_t b)    { *wp_++ = b; }
+	void WU32(uint32_t v)    { memcpy(wp_, &v, 4); wp_ += 4; }
+	void WDbl(double v)      { memcpy(wp_, &v, 8); wp_ += 8; }
 
-	double UnscaleCoord(int32_t val) {
-		if (val == EMPTY_COORD) return std::numeric_limits<double>::quiet_NaN(); // #5: empty geometry
+	double Unscale(int32_t val) {
+		if (val == EMPTY_COORD) return std::numeric_limits<double>::quiet_NaN();
 		return static_cast<double>(val) * inv_scale_;
 	}
 
 	void DecodeCoordinateSequence() {
-		uint32_t num_points = ReadUint32();
-		WriteUint32(num_points);
+		uint32_t num_points = RU32();
+		WU32(num_points);
+		if (num_points == 0) return;
+
+		// First vertex: absolute
 		int32_t prev[4] = {0, 0, 0, 0};
-		for (uint32_t i = 0; i < num_points; i++) {
-			for (uint32_t d = 0; d < vertex_width_; d++) {
-				if (i == 0) {
-					prev[d] = ReadInt32(); // absolute
-				} else {
-					prev[d] += ReadDelta(); // accumulate
-				}
-				WriteDouble(UnscaleCoord(prev[d]));
+		for (uint32_t d = 0; d < vw_; d++) {
+			prev[d] = RI32();
+			WDbl(Unscale(prev[d]));
+		}
+		// Remaining vertices: delta (no branch in inner loop)
+		for (uint32_t i = 1; i < num_points; i++) {
+			for (uint32_t d = 0; d < vw_; d++) {
+				prev[d] += RDelta();
+				WDbl(Unscale(prev[d]));
 			}
 		}
 	}
@@ -364,8 +349,8 @@ private:
 	void DecodeGeometry(GeometryType type) {
 		switch (type) {
 		case GeometryType::POINT: {
-			for (uint32_t d = 0; d < vertex_width_; d++) {
-				WriteDouble(UnscaleCoord(ReadInt32()));
+			for (uint32_t d = 0; d < vw_; d++) {
+				WDbl(Unscale(RI32()));
 			}
 			break;
 		}
@@ -374,8 +359,8 @@ private:
 			break;
 		}
 		case GeometryType::POLYGON: {
-			uint32_t num_rings = ReadUint32();
-			WriteUint32(num_rings);
+			uint32_t num_rings = RU32();
+			WU32(num_rings);
 			for (uint32_t r = 0; r < num_rings; r++) {
 				DecodeCoordinateSequence();
 			}
@@ -384,31 +369,31 @@ private:
 		case GeometryType::MULTIPOINT:
 		case GeometryType::MULTILINESTRING:
 		case GeometryType::MULTIPOLYGON: {
-			uint32_t num_parts = ReadUint32();
-			WriteUint32(num_parts);
+			uint32_t num_parts = RU32();
+			WU32(num_parts);
 			auto inner = (type == GeometryType::MULTIPOINT)       ? GeometryType::POINT
 			             : (type == GeometryType::MULTILINESTRING) ? GeometryType::LINESTRING
 			                                                      : GeometryType::POLYGON;
+			uint32_t wkb_type = static_cast<uint32_t>(inner);
+			if (vw_ >= 3) wkb_type |= 0x80000000;
+			if (vw_ == 4) wkb_type |= 0x40000000;
 			for (uint32_t p = 0; p < num_parts; p++) {
-				WriteByte(0x01);
-				uint32_t wkb_type = static_cast<uint32_t>(inner);
-				if (vertex_width_ >= 3) wkb_type |= 0x80000000;
-				if (vertex_width_ == 4) wkb_type |= 0x40000000;
-				WriteUint32(wkb_type);
+				WByte(0x01);
+				WU32(wkb_type);
 				DecodeGeometry(inner);
 			}
 			break;
 		}
 		case GeometryType::GEOMETRYCOLLECTION: {
-			uint32_t num_parts = ReadUint32();
-			WriteUint32(num_parts);
+			uint32_t num_parts = RU32();
+			WU32(num_parts);
 			for (uint32_t p = 0; p < num_parts; p++) {
-				auto child_type = static_cast<GeometryType>(ReadByte());
-				WriteByte(0x01);
+				auto child_type = static_cast<GeometryType>(RByte());
+				WByte(0x01);
 				uint32_t wkb_type = static_cast<uint32_t>(child_type);
-				if (vertex_width_ >= 3) wkb_type |= 0x80000000;
-				if (vertex_width_ == 4) wkb_type |= 0x40000000;
-				WriteUint32(wkb_type);
+				if (vw_ >= 3) wkb_type |= 0x80000000;
+				if (vw_ == 4) wkb_type |= 0x40000000;
+				WU32(wkb_type);
 				DecodeGeometry(child_type);
 			}
 			break;
@@ -418,12 +403,10 @@ private:
 		}
 	}
 
-	int64_t scale_ = DEFAULT_SCALE;
 	double inv_scale_ = 1.0 / static_cast<double>(DEFAULT_SCALE);
-	uint32_t vertex_width_ = 2;
-	const uint8_t *silo_ = nullptr;
-	idx_t silo_size_ = 0;
-	idx_t pos_ = 0;
+	uint32_t vw_ = 2;
+	const uint8_t *rp_ = nullptr;
+	uint8_t *wp_ = nullptr;
 	vector<uint8_t> buf_;
 };
 
@@ -451,20 +434,18 @@ static unique_ptr<FunctionData> SiloEncodeWithScaleBind(ClientContext &context, 
 // ---------------------------------------------------------------------------
 
 // #2: encode reads GEOMETRY string_t data directly as WKB — no intermediate Vector
+// DuckDB's internal GEOMETRY format IS WKB (ToBinary is a no-op Reinterpret),
+// so we read the GEOMETRY bytes directly without conversion.
 static void SiloEncodeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<SiloEncodeBindData>();
 	int64_t scale = bind_data.scale;
 
 	auto &geom_vec = args.data[0];
 
-	// Convert GEOMETRY → WKB (needed because internal format differs from WKB)
-	Vector wkb_vec(LogicalType::BLOB, args.size());
-	Geometry::ToBinary(geom_vec, wkb_vec, args.size());
-
-	UnaryExecutor::Execute<string_t, string_t>(wkb_vec, result, args.size(), [&](string_t wkb) {
-		SiloWriter writer(scale);
-		writer.EncodeWKB(reinterpret_cast<const uint8_t *>(wkb.GetData()), static_cast<idx_t>(wkb.GetSize()));
-		return writer.Finish(result);
+	SiloWriter writer(scale);
+	UnaryExecutor::Execute<string_t, string_t>(geom_vec, result, args.size(), [&](string_t geom) {
+		return writer.Encode(reinterpret_cast<const uint8_t *>(geom.GetData()),
+		                     static_cast<idx_t>(geom.GetSize()), result);
 	});
 }
 
@@ -472,33 +453,26 @@ static void SiloEncodeWithScaleFunction(DataChunk &args, ExpressionState &state,
 	auto &geom_vec = args.data[0];
 	auto &scale_vec = args.data[1];
 
-	Vector wkb_vec(LogicalType::BLOB, args.size());
-	Geometry::ToBinary(geom_vec, wkb_vec, args.size());
-
+	SiloWriter writer(0);
 	BinaryExecutor::Execute<string_t, int64_t, string_t>(
-	    wkb_vec, scale_vec, result, args.size(), [&](string_t wkb, int64_t scale) {
-		    SiloWriter writer(scale);
-		    writer.EncodeWKB(reinterpret_cast<const uint8_t *>(wkb.GetData()),
-		                     static_cast<idx_t>(wkb.GetSize()));
-		    return writer.Finish(result);
+	    geom_vec, scale_vec, result, args.size(), [&](string_t geom, int64_t scale) {
+		    writer.SetScale(scale);
+		    return writer.Encode(reinterpret_cast<const uint8_t *>(geom.GetData()),
+		                         static_cast<idx_t>(geom.GetSize()), result);
 	    });
 }
 
-// #2: decode writes WKB directly into the result GEOMETRY vector via per-value FromBinary
+// Decode writes WKB directly into the GEOMETRY result vector — no intermediate.
+// DuckDB's internal GEOMETRY format IS WKB, so the bytes SiloReader produces
+// are already valid GEOMETRY data.
 static void SiloDecodeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
 
-	// We need a temporary vector for per-value WKB output, then convert to GEOMETRY
-	Vector wkb_vec(LogicalType::BLOB, args.size());
-
-	UnaryExecutor::Execute<string_t, string_t>(blob_vec, wkb_vec, args.size(), [&](string_t blob) {
-		SiloReader reader;
-		reader.Decode(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()));
-		return reader.Finish(wkb_vec);
+	SiloReader reader;
+	UnaryExecutor::Execute<string_t, string_t>(blob_vec, result, args.size(), [&](string_t blob) {
+		return reader.Decode(reinterpret_cast<const uint8_t *>(blob.GetData()),
+		                     static_cast<idx_t>(blob.GetSize()), result);
 	});
-
-	// Batch convert WKB → GEOMETRY
-	Geometry::FromBinary(wkb_vec, result, args.size(), true);
 }
 
 // silo_metadata(blob) → STRUCT{geometry_type VARCHAR, vertex_type VARCHAR, scale BIGINT}
@@ -611,35 +585,26 @@ struct ArrowGeoSilo {
 		schema.format = (options.arrow_offset_size == ArrowOffsetSize::LARGE) ? "Z" : "z";
 	}
 
-	// Arrow → DuckDB: silo blob → GEOMETRY
+	// Arrow → DuckDB: silo blob → GEOMETRY (direct, no WKB intermediate)
 	static void ArrowToDuck(ClientContext &context, Vector &source, Vector &result, idx_t count) {
-		Vector wkb_vec(LogicalType::BLOB, count);
-
-		UnaryExecutor::Execute<string_t, string_t>(source, wkb_vec, count, [&](string_t blob) {
-			SiloReader reader;
-			reader.Decode(reinterpret_cast<const uint8_t *>(blob.GetData()),
-			              static_cast<idx_t>(blob.GetSize()));
-			return reader.Finish(wkb_vec);
+		SiloReader reader;
+		UnaryExecutor::Execute<string_t, string_t>(source, result, count, [&](string_t blob) {
+			return reader.Decode(reinterpret_cast<const uint8_t *>(blob.GetData()),
+			                     static_cast<idx_t>(blob.GetSize()), result);
 		});
-
-		Geometry::FromBinary(wkb_vec, result, count, true);
 	}
 
-	// DuckDB → Arrow: GEOMETRY → silo blob
+	// DuckDB → Arrow: GEOMETRY → silo blob (direct, no WKB intermediate)
 	static void DuckToArrow(ClientContext &context, Vector &source, Vector &result, idx_t count) {
 		int64_t scale = DEFAULT_SCALE;
 		if (source.GetType().id() == LogicalTypeId::GEOMETRY && GeoType::HasCRS(source.GetType())) {
 			scale = ScaleFromCRS(GeoType::GetCRS(source.GetType()));
 		}
 
-		Vector wkb_vec(LogicalType::BLOB, count);
-		Geometry::ToBinary(source, wkb_vec, count);
-
-		UnaryExecutor::Execute<string_t, string_t>(wkb_vec, result, count, [&](string_t wkb) {
-			SiloWriter writer(scale);
-			writer.EncodeWKB(reinterpret_cast<const uint8_t *>(wkb.GetData()),
-			                 static_cast<idx_t>(wkb.GetSize()));
-			return writer.Finish(result);
+		SiloWriter writer(scale);
+		UnaryExecutor::Execute<string_t, string_t>(source, result, count, [&](string_t geom) {
+			return writer.Encode(reinterpret_cast<const uint8_t *>(geom.GetData()),
+			                     static_cast<idx_t>(geom.GetSize()), result);
 		});
 	}
 };
