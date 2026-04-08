@@ -4,7 +4,7 @@ A DuckDB extension for compact geometry encoding. Delta-encodes coordinates as s
 
 ```sql
 INSTALL spatial; LOAD spatial;
-LOAD geosilo;
+INSTALL geosilo FROM community; LOAD geosilo;
 
 -- Encode: GEOMETRY → compact BLOB
 SELECT silo_encode(geom) FROM my_table;
@@ -87,7 +87,7 @@ Reproduce with: `./build/release/duckdb -f scripts/benchmark.sql` (requires `tig
 
 ```sql
 INSTALL spatial; LOAD spatial;
-LOAD geosilo;
+INSTALL geosilo FROM community; LOAD geosilo;
 
 -- Roundtrip
 SELECT ST_AsText(silo_decode(silo_encode(
