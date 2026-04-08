@@ -49,27 +49,44 @@ namespace duckdb {
 //     If delta doesn't fit int16, write INT16_MIN as sentinel, then int32 delta.
 //   Empty point (NaN): INT32_MAX sentinel per dimension.
 //
-// Version history:
-//   v1 (0x01): MULTIPOINT stores each sub-point with absolute int32 coords.
-//   v2 (0x02): MULTIPOINT uses delta encoding between sub-points
-//              (first absolute, rest delta — same as linestring sequences).
-//              All other geometry types are identical to v1.
-//   The reader accepts both v1 and v2. The writer always emits v2 for
-//   MULTIPOINT and v1 for all other types using the full header.
+// Version history (full header only — compact headers always use latest):
+//   v1 (0x01): Original encoding.
+//   v2 (0x02): MULTIPOINT uses delta encoding between sub-points.
+//   v3 (0x03): Polygon rings omit the closing vertex (reconstructed on decode).
+//   The reader accepts v1, v2, and v3. Feature checks:
+//     MULTIPOINT delta: version >= 2
+//     Ring closure elimination: version >= 3
 
 static constexpr uint8_t GEOSILO_MAGIC      = 0x47; // 'G' — full header
-static constexpr uint8_t GEOSILO_VERSION_1   = 0x01; // v1: MULTIPOINT uses absolute coords per point
-static constexpr uint8_t GEOSILO_VERSION_2   = 0x02; // v2: MULTIPOINT uses delta encoding between points
+static constexpr uint8_t GEOSILO_VERSION_1   = 0x01;
+static constexpr uint8_t GEOSILO_VERSION_2   = 0x02; // + MULTIPOINT delta
+static constexpr uint8_t GEOSILO_VERSION_3   = 0x03; // + ring closure elimination
 static constexpr int64_t DEFAULT_SCALE       = 10000000; // 1e7
 static constexpr int16_t DELTA_ESCAPE        = std::numeric_limits<int16_t>::min(); // -32768
 static constexpr int32_t EMPTY_COORD         = std::numeric_limits<int32_t>::max();
 
-// Compact point magic bytes — the single byte implies geometry_type, vertex_type, and scale.
-// Body is just the raw int32 coordinates (8 bytes for XY, 12 bytes for XYZ).
-static constexpr uint8_t COMPACT_POINT_XY_1E7   = 0x50; // 'P' — POINT XY, scale 1e7
-static constexpr uint8_t COMPACT_POINT_XYZ_1E7  = 0x51; // 'Q' — POINT XYZ, scale 1e7
-static constexpr uint8_t COMPACT_POINT_XY_100   = 0x52; // 'R' — POINT XY, scale 100
-static constexpr uint8_t COMPACT_POINT_XYZ_100  = 0x53; // 'S' — POINT XYZ, scale 100
+// ---------------------------------------------------------------------------
+// Compact magic bytes (0x50 – 0x67)
+// ---------------------------------------------------------------------------
+// A single byte replaces the 12-byte full header by encoding geometry type,
+// vertex type, and scale. Each geometry type gets 4 consecutive values:
+//   base + 0 = XY,  scale 1e7
+//   base + 1 = XYZ, scale 1e7
+//   base + 2 = XY,  scale 100
+//   base + 3 = XYZ, scale 100
+//
+// Compact headers always imply the latest encoding features for that type
+// (MULTIPOINT delta, ring closure elimination, etc.).
+
+static constexpr uint8_t COMPACT_MAGIC_BASE  = 0x50;
+static constexpr uint8_t COMPACT_MAGIC_MAX   = 0x67;
+// Per-type bases (for readability):
+static constexpr uint8_t COMPACT_POINT_BASE          = 0x50; // 0x50–0x53
+static constexpr uint8_t COMPACT_LINESTRING_BASE     = 0x54; // 0x54–0x57
+static constexpr uint8_t COMPACT_POLYGON_BASE        = 0x58; // 0x58–0x5B
+static constexpr uint8_t COMPACT_MULTIPOINT_BASE     = 0x5C; // 0x5C–0x5F
+static constexpr uint8_t COMPACT_MULTILINESTRING_BASE = 0x60; // 0x60–0x63
+static constexpr uint8_t COMPACT_MULTIPOLYGON_BASE   = 0x64; // 0x64–0x67
 
 // ---------------------------------------------------------------------------
 // Scale detection from CRS
@@ -149,13 +166,17 @@ public:
 		buf_.resize(size + 14);
 		wp_ = buf_.data();
 
-		// Try compact point encoding: single magic byte replaces the full header.
-		uint8_t compact_magic = TryCompactPointMagic(geom_type, vert_type);
+		// Try compact encoding: single magic byte replaces the 12-byte full header.
+		uint8_t compact_magic = TryCompactMagic(geom_type, vert_type);
 		if (compact_magic) {
 			WByte(compact_magic);
+			ring_closure_ = (geom_type == GeometryType::POLYGON || geom_type == GeometryType::MULTIPOLYGON);
 		} else {
-			// Full header — use v2 for MULTIPOINT (delta encoding)
-			uint8_t version = (geom_type == GeometryType::MULTIPOINT) ? GEOSILO_VERSION_2 : GEOSILO_VERSION_1;
+			// Full header — version selects encoding features
+			uint8_t version = GEOSILO_VERSION_1;
+			if (geom_type == GeometryType::MULTIPOINT) version = GEOSILO_VERSION_2;
+			if (geom_type == GeometryType::POLYGON || geom_type == GeometryType::MULTIPOLYGON) version = GEOSILO_VERSION_3;
+			ring_closure_ = (version >= GEOSILO_VERSION_3);
 			WByte(GEOSILO_MAGIC);
 			WByte(version);
 			WByte(static_cast<uint8_t>(geom_type));
@@ -182,18 +203,25 @@ private:
 	void WI32(int32_t v)     { memcpy(wp_, &v, 4); wp_ += 4; }
 	void WI64(int64_t v)     { memcpy(wp_, &v, 8); wp_ += 8; }
 
-	// Returns a compact magic byte if this is a POINT with a well-known scale, else 0.
-	uint8_t TryCompactPointMagic(GeometryType type, VertexType vert_type) {
-		if (type != GeometryType::POINT || vert_type == VertexType::XYM || vert_type == VertexType::XYZM) {
-			return 0;
+	// Returns a compact magic byte for well-known type/vertex/scale combos, else 0.
+	uint8_t TryCompactMagic(GeometryType type, VertexType vert_type) {
+		if (vert_type == VertexType::XYM || vert_type == VertexType::XYZM) return 0;
+		if (type == GeometryType::GEOMETRYCOLLECTION) return 0;
+
+		uint8_t type_base;
+		switch (type) {
+		case GeometryType::POINT:            type_base = COMPACT_POINT_BASE; break;
+		case GeometryType::LINESTRING:       type_base = COMPACT_LINESTRING_BASE; break;
+		case GeometryType::POLYGON:          type_base = COMPACT_POLYGON_BASE; break;
+		case GeometryType::MULTIPOINT:       type_base = COMPACT_MULTIPOINT_BASE; break;
+		case GeometryType::MULTILINESTRING:  type_base = COMPACT_MULTILINESTRING_BASE; break;
+		case GeometryType::MULTIPOLYGON:     type_base = COMPACT_MULTIPOLYGON_BASE; break;
+		default: return 0;
 		}
-		bool is_xy = (vert_type == VertexType::XY);
-		if (scale_ == 10000000) {
-			return is_xy ? COMPACT_POINT_XY_1E7 : COMPACT_POINT_XYZ_1E7;
-		}
-		if (scale_ == 100) {
-			return is_xy ? COMPACT_POINT_XY_100 : COMPACT_POINT_XYZ_100;
-		}
+
+		uint8_t offset = (vert_type == VertexType::XYZ) ? 1 : 0;
+		if (scale_ == 10000000) return type_base + offset;
+		if (scale_ == 100) return type_base + 2 + offset;
 		return 0;
 	}
 
@@ -237,6 +265,36 @@ private:
 		}
 	}
 
+	// Encode a polygon ring, omitting the closing vertex (which equals the first).
+	// WKB ring has num_points including closure; we store num_points - 1.
+	void EncodeRing(uint32_t num_points) {
+		if (num_points < 2) {
+			WU32(num_points);
+			// Consume remaining WKB coords
+			for (uint32_t i = 0; i < num_points; i++)
+				for (uint32_t d = 0; d < vw_; d++) RDbl();
+			return;
+		}
+		WU32(num_points - 1); // stored count excludes closure
+
+		// First vertex: absolute
+		int32_t prev[4] = {0, 0, 0, 0};
+		for (uint32_t d = 0; d < vw_; d++) {
+			prev[d] = ScaleCoord(RDbl());
+			WI32(prev[d]);
+		}
+		// Middle vertices: delta (up to num_points - 2, skipping closure)
+		for (uint32_t i = 1; i < num_points - 1; i++) {
+			for (uint32_t d = 0; d < vw_; d++) {
+				int32_t scaled = ScaleCoord(RDbl());
+				WriteDelta(scaled - prev[d]);
+				prev[d] = scaled;
+			}
+		}
+		// Consume the closing vertex from WKB (discard — it equals the first)
+		for (uint32_t d = 0; d < vw_; d++) RDbl();
+	}
+
 	// Delta-encode MULTIPOINT: like a coordinate sequence but skipping WKB sub-headers.
 	void EncodeMultiPointDelta() {
 		uint32_t num_parts = RU32();
@@ -277,7 +335,9 @@ private:
 			uint32_t num_rings = RU32();
 			WU32(num_rings);
 			for (uint32_t r = 0; r < num_rings; r++) {
-				EncodeCoordinateSequence(RU32());
+				uint32_t npts = RU32();
+				if (ring_closure_) EncodeRing(npts);
+				else EncodeCoordinateSequence(npts);
 			}
 			break;
 		}
@@ -317,6 +377,7 @@ private:
 
 	int64_t scale_;
 	double dbl_scale_;
+	bool ring_closure_ = false; // true = omit closing vertex in polygon rings
 	uint32_t vw_ = 2;
 	const uint8_t *rp_ = nullptr;
 	uint8_t *wp_ = nullptr;
@@ -324,45 +385,27 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Compact point magic resolution
+// Compact magic resolution
 // ---------------------------------------------------------------------------
 
+// Decode a compact magic byte into geometry type, vertex type, and inverse scale.
 static void ResolveCompactMagic(uint8_t magic, GeometryType &geom_type, VertexType &vert_type, double &inv_scale) {
-	geom_type = GeometryType::POINT;
-	switch (magic) {
-	case COMPACT_POINT_XY_1E7:
-		vert_type = VertexType::XY;
-		inv_scale = 1.0 / 10000000.0;
-		break;
-	case COMPACT_POINT_XYZ_1E7:
-		vert_type = VertexType::XYZ;
-		inv_scale = 1.0 / 10000000.0;
-		break;
-	case COMPACT_POINT_XY_100:
-		vert_type = VertexType::XY;
-		inv_scale = 1.0 / 100.0;
-		break;
-	case COMPACT_POINT_XYZ_100:
-		vert_type = VertexType::XYZ;
-		inv_scale = 1.0 / 100.0;
-		break;
-	default:
-		throw InvalidInputException("GeoSilo: invalid compact magic 0x%02x", magic);
-	}
+	static constexpr GeometryType type_table[] = {
+		GeometryType::POINT, GeometryType::LINESTRING, GeometryType::POLYGON,
+		GeometryType::MULTIPOINT, GeometryType::MULTILINESTRING, GeometryType::MULTIPOLYGON
+	};
+	uint8_t offset = magic - COMPACT_MAGIC_BASE;
+	uint8_t type_idx = offset / 4;
+	uint8_t variant = offset % 4; // 0=XY/1e7, 1=XYZ/1e7, 2=XY/100, 3=XYZ/100
+
+	geom_type = type_table[type_idx];
+	vert_type = (variant & 1) ? VertexType::XYZ : VertexType::XY;
+	inv_scale = (variant >= 2) ? (1.0 / 100.0) : (1.0 / 10000000.0);
 }
 
 // Map compact magic → scale (for metadata)
 static int64_t CompactMagicScale(uint8_t magic) {
-	switch (magic) {
-	case COMPACT_POINT_XY_1E7:
-	case COMPACT_POINT_XYZ_1E7:
-		return 10000000;
-	case COMPACT_POINT_XY_100:
-	case COMPACT_POINT_XYZ_100:
-		return 100;
-	default:
-		return 0;
-	}
+	return ((magic - COMPACT_MAGIC_BASE) % 4 >= 2) ? 100 : 10000000;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,15 +426,16 @@ public:
 		GeometryType geom_type;
 		VertexType vert_type;
 
-		if (magic >= COMPACT_POINT_XY_1E7 && magic <= COMPACT_POINT_XYZ_100) {
-			// Compact point format — magic byte encodes everything.
+		if (magic >= COMPACT_MAGIC_BASE && magic <= COMPACT_MAGIC_MAX) {
+			// Compact format — magic byte encodes type, vertex, scale.
+			// Compact headers always imply latest features.
 			ResolveCompactMagic(magic, geom_type, vert_type, inv_scale_);
-			version_ = GEOSILO_VERSION_2;
+			version_ = GEOSILO_VERSION_3;
 		} else if (magic == GEOSILO_MAGIC) {
 			// Full header
 			if (size < 12) throw InvalidInputException("GeoSilo: blob too small");
 			version_ = RByte();
-			if (version_ != GEOSILO_VERSION_1 && version_ != GEOSILO_VERSION_2) {
+			if (version_ < GEOSILO_VERSION_1 || version_ > GEOSILO_VERSION_3) {
 				throw InvalidInputException("GeoSilo: unsupported version %d", version_);
 			}
 			geom_type = static_cast<GeometryType>(RByte());
@@ -497,6 +541,33 @@ private:
 		}
 	}
 
+	// Decode a polygon ring where the closing vertex was omitted.
+	// Stored count = N-1; we emit N points (reconstruct closure from first vertex).
+	void DecodeRing() {
+		uint32_t stored_count = RU32();
+		WU32(stored_count + 1); // WKB ring includes closure
+		if (stored_count == 0) return;
+
+		// First vertex: absolute (remember for closure)
+		int32_t first[4] = {0, 0, 0, 0};
+		int32_t prev[4] = {0, 0, 0, 0};
+		for (uint32_t d = 0; d < vw_; d++) {
+			first[d] = prev[d] = RI32();
+			WDbl(Unscale(prev[d]));
+		}
+		// Middle vertices: delta
+		for (uint32_t i = 1; i < stored_count; i++) {
+			for (uint32_t d = 0; d < vw_; d++) {
+				prev[d] += RDelta();
+				WDbl(Unscale(prev[d]));
+			}
+		}
+		// Reconstruct closing vertex (= first)
+		for (uint32_t d = 0; d < vw_; d++) {
+			WDbl(Unscale(first[d]));
+		}
+	}
+
 	void DecodeGeometry(GeometryType type) {
 		switch (type) {
 		case GeometryType::POINT: {
@@ -513,7 +584,8 @@ private:
 			uint32_t num_rings = RU32();
 			WU32(num_rings);
 			for (uint32_t r = 0; r < num_rings; r++) {
-				DecodeCoordinateSequence();
+				if (version_ >= GEOSILO_VERSION_3) DecodeRing();
+				else DecodeCoordinateSequence();
 			}
 			break;
 		}
@@ -673,10 +745,13 @@ static void SiloMetadataFunction(DataChunk &args, ExpressionState &state, Vector
 		auto size = static_cast<idx_t>(blob.GetSize());
 		uint8_t gt, vt;
 		int64_t scale;
-		if (data[0] >= COMPACT_POINT_XY_1E7 && data[0] <= COMPACT_POINT_XYZ_100) {
-			gt = static_cast<uint8_t>(GeometryType::POINT);
-			bool is_xyz = (data[0] == COMPACT_POINT_XYZ_1E7 || data[0] == COMPACT_POINT_XYZ_100);
-			vt = is_xyz ? static_cast<uint8_t>(VertexType::XYZ) : static_cast<uint8_t>(VertexType::XY);
+		if (data[0] >= COMPACT_MAGIC_BASE && data[0] <= COMPACT_MAGIC_MAX) {
+			GeometryType geom_type_val;
+			VertexType vert_type_val;
+			double unused;
+			ResolveCompactMagic(data[0], geom_type_val, vert_type_val, unused);
+			gt = static_cast<uint8_t>(geom_type_val);
+			vt = static_cast<uint8_t>(vert_type_val);
 			scale = CompactMagicScale(data[0]);
 		} else if (data[0] == GEOSILO_MAGIC && size >= 12) {
 			gt = data[2];
