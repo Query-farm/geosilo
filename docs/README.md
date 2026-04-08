@@ -58,26 +58,15 @@ SELECT silo_encode(geom, 100) FROM my_utm_table;
 
 ## Benchmarks
 
-Tested on US Census TIGER/Line 2025 boundary data (WGS84). All ratios relative to 1.00x = default WKB size.
+Geometry column size on US Census TIGER/Line 2025 boundary data (WGS84). All ratios relative to standard WKB.
 
-### On-disk storage (geom column only)
-
-| Table | Default GEOMETRY | Shredded + ALP | Silo | Silo + ZSTD |
+| Table | Rows | WKB | Silo | Silo + ZSTD |
 |---|---|---|---|---|
-| block_group | 294 MB (1.00x) | 182 MB (0.62x) | 75 MB (0.25x) | 71 MB (0.24x) |
-| zcta5 | 189 MB (1.00x) | 76 MB (0.40x) | 71 MB (0.38x) | 71 MB (0.38x) |
-| county | 25 MB (1.00x) | 11 MB (0.44x) | 8 MB (0.34x) | 8 MB (0.34x) |
-| urban_area | 24 MB (1.00x) | 10 MB (0.42x) | 9 MB (0.37x) | 9 MB (0.37x) |
-
-### Wire transfer (serialized geometry column)
-
-| Table | Rows | WKB (1.00x) | Silo | WKB + ZSTD | Silo + ZSTD |
-|---|---|---|---|---|---|
-| block_group | 242,748 | 209.2 MB | 68.4 MB (0.33x) | 129.1 MB (0.62x) | 57.5 MB (0.28x) |
-| zcta5 | 33,791 | 180.0 MB | 52.9 MB (0.29x) | 134.9 MB (0.75x) | 47.6 MB (0.26x) |
-| tract | 85,529 | 124.6 MB | 39.5 MB (0.32x) | 75.6 MB (0.61x) | 34.1 MB (0.27x) |
-| county | 3,235 | 24.6 MB | 7.5 MB (0.31x) | 19.7 MB (0.80x) | 6.7 MB (0.27x) |
-| urban_area | 2,644 | 23.2 MB | 6.9 MB (0.29x) | 18.3 MB (0.79x) | 6.1 MB (0.26x) |
+| block_group | 242,748 | 209 MB | 68 MB (0.33x) | 58 MB (0.28x) |
+| zcta5 | 33,791 | 180 MB | 53 MB (0.29x) | 48 MB (0.26x) |
+| tract | 85,529 | 125 MB | 40 MB (0.32x) | 34 MB (0.27x) |
+| county | 3,235 | 25 MB | 8 MB (0.31x) | 7 MB (0.27x) |
+| urban_area | 2,644 | 23 MB | 7 MB (0.29x) | 6 MB (0.26x) |
 
 Reproduce with: `./build/release/duckdb -f scripts/benchmark.sql` (requires `tiger.duckdb` in the working directory).
 
