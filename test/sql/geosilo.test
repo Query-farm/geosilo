@@ -353,11 +353,11 @@ true
 # Invalid input
 # ---------------------------------------------------------------------------
 
-# Random blob (too small) should fail
+# Random blob (invalid magic) should fail
 statement error
 SELECT geosilo_decode('\x00\x01\x02\x03'::BLOB);
 ----
-GeoSilo: blob too small
+GeoSilo: invalid magic byte
 
 # Truncated blob (too small for header)
 statement error
@@ -427,3 +427,131 @@ SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT(1.23456789
     != ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT(1.23456789 2.34567891)'), 10000000)));
 ----
 true
+
+# ---------------------------------------------------------------------------
+# Compact point encoding
+# ---------------------------------------------------------------------------
+
+# POINT XY with default scale (1e7) → compact format: 1 magic + 4+4 coords = 9 bytes
+query I
+SELECT octet_length(geosilo_encode(ST_GeomFromText('POINT(-77.0364 38.8977)')));
+----
+9
+
+# POINT XY with scale 100 → compact format: 9 bytes
+query I
+SELECT octet_length(geosilo_encode(ST_GeomFromText('POINT(500000 4500000)'), 100));
+----
+9
+
+# POINT XY with non-standard scale → full header: 12 + 8 = 20 bytes
+query I
+SELECT octet_length(geosilo_encode(ST_GeomFromText('POINT(1.0 2.0)'), 1000));
+----
+20
+
+# Compact point roundtrip (scale 1e7)
+query I
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT(-77.0364 38.8977)'))));
+----
+POINT (-77.0364 38.8977)
+
+# Compact point roundtrip (scale 100)
+query I
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT(500000 4500000)'), 100)));
+----
+POINT (500000 4500000)
+
+# Compact point metadata
+query III
+SELECT m.geometry_type, m.vertex_type, m.scale
+FROM (SELECT geosilo_metadata(geosilo_encode(ST_GeomFromText('POINT(-77.0364 38.8977)'))) AS m);
+----
+POINT	XY	10000000
+
+# Compact point metadata (scale 100)
+query III
+SELECT m.geometry_type, m.vertex_type, m.scale
+FROM (SELECT geosilo_metadata(geosilo_encode(ST_GeomFromText('POINT(500000 4500000)'), 100)) AS m);
+----
+POINT	XY	100
+
+# Empty compact point roundtrip
+query I
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('POINT EMPTY'))));
+----
+POINT EMPTY
+
+# Empty compact point size
+query I
+SELECT octet_length(geosilo_encode(ST_GeomFromText('POINT EMPTY')));
+----
+9
+
+# LINESTRING still uses full header (not compact)
+query I
+SELECT octet_length(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1)'))) > 12;
+----
+true
+
+# Batch of compact points roundtrips correctly
+query I
+SELECT count(*) FROM (
+    SELECT i, ST_AsText(geosilo_decode(geosilo_encode(
+        ST_Point(i * 0.001 - 77.0, i * 0.001 + 38.0)))) AS txt
+    FROM range(1000) t(i)
+) WHERE txt IS NOT NULL;
+----
+1000
+
+# ---------------------------------------------------------------------------
+# MULTIPOINT delta encoding (v2)
+# ---------------------------------------------------------------------------
+
+# Basic MULTIPOINT roundtrip
+query I
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('MULTIPOINT(1 2, 3 4, 5 6)'))));
+----
+MULTIPOINT (1 2, 3 4, 5 6)
+
+# Empty MULTIPOINT roundtrip
+query I
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('MULTIPOINT EMPTY'))));
+----
+MULTIPOINT EMPTY
+
+# MULTIPOINT metadata reports version correctly
+query III
+SELECT m.geometry_type, m.vertex_type, m.scale
+FROM (SELECT geosilo_metadata(geosilo_encode(ST_GeomFromText('MULTIPOINT(1 2, 3 4)'))) AS m);
+----
+MULTIPOINT	XY	10000000
+
+# MULTIPOINT with clustered points benefits from delta encoding.
+# 10 nearby points: v2 delta should be smaller than 10 absolute points.
+# Absolute would be: 12 header + 4 count + 10 * 8 = 96 bytes.
+# Delta: 12 header + 4 count + 8 first + 9 * 4 deltas = 60 bytes (if all int16).
+query I
+SELECT octet_length(geosilo_encode(ST_GeomFromText(
+    'MULTIPOINT(-77.0 38.0, -77.001 38.001, -77.002 38.002, -77.003 38.003, -77.004 38.004, -77.005 38.005, -77.006 38.006, -77.007 38.007, -77.008 38.008, -77.009 38.009)'
+))) < 96;
+----
+true
+
+# Large batch of MULTIPOINT roundtrips
+query I
+SELECT count(*) FROM (
+    SELECT ST_AsText(geosilo_decode(geosilo_encode(
+        ST_Multi(ST_Union(ST_Point(i * 0.001 - 77.0, i * 0.001 + 38.0),
+                          ST_Point(i * 0.001 - 76.5, i * 0.001 + 38.5)))
+    ))) AS txt
+    FROM range(500) t(i)
+) WHERE txt IS NOT NULL;
+----
+500
+
+# MULTIPOINT with large delta (escape path)
+query I
+SELECT ST_AsText(geosilo_decode(geosilo_encode(ST_GeomFromText('MULTIPOINT(0 0, 100 100)'))));
+----
+MULTIPOINT (0 0, 100 100)
