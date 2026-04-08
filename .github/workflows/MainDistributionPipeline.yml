@@ -18,13 +18,4 @@ jobs:
     with:
       duckdb_version: v1.5.1
       ci_tools_version: v1.5.1
-      extension_name: quack
-
-  code-quality-check:
-    name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.1
-    with:
-      duckdb_version: v1.5.1
-      ci_tools_version: v1.5.1
-      extension_name: quack
-      format_checks: 'format;tidy'
+      extension_name: geosilo
