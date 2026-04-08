@@ -31,6 +31,18 @@ Decodes a GeoSilo blob back into a GEOMETRY value.
 SELECT ST_AsText(silo_decode(encoded_geom)) FROM my_table;
 ```
 
+### `silo_metadata(blob)`
+
+Returns the header fields from a GeoSilo blob without decoding the geometry.
+
+- **blob** (BLOB) — GeoSilo-encoded geometry
+- **Returns** `STRUCT{geometry_type VARCHAR, vertex_type VARCHAR, scale BIGINT}`
+
+```sql
+SELECT silo_metadata(silo_encode(ST_GeomFromText('POINT(1 2)')));
+-- {'geometry_type': POINT, 'vertex_type': XY, 'scale': 10000000}
+```
+
 ### Roundtrip
 
 ```sql
@@ -39,6 +51,27 @@ SELECT ST_AsText(silo_decode(silo_encode(
 )));
 -- POLYGON ((-75.5 39.7, -75.4 39.8, -75.3 39.7, -75.5 39.7))
 ```
+
+## Arrow extension type: `queryfarm.geosilo`
+
+GeoSilo registers an [Arrow extension type](https://arrow.apache.org/docs/format/Columnar.html#extension-types) named `queryfarm.geosilo`. When an Arrow column carries this metadata, DuckDB automatically decodes silo blobs to GEOMETRY on read and encodes GEOMETRY to silo blobs on write.
+
+This enables transparent compression over Arrow IPC transports (e.g., VGI, Arrow Flight) — the worker produces silo blobs, tags the column, and the client receives GEOMETRY without calling `silo_decode` explicitly.
+
+**Producer (Python/PyArrow):**
+
+```python
+import pyarrow as pa
+
+geom_field = pa.field("geom", pa.binary(), metadata={
+    b"ARROW:extension:name": b"queryfarm.geosilo",
+    b"ARROW:extension:metadata": b"",
+})
+```
+
+**Consumer (DuckDB with geosilo loaded):**
+
+The BLOB column is automatically converted to GEOMETRY — no `silo_decode()` call needed.
 
 ## How it works
 

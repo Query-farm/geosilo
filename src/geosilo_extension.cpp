@@ -6,6 +6,8 @@
 #include "duckdb/common/types/geometry.hpp"
 #include "duckdb/common/types/geometry_crs.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/common/arrow/arrow_type_extension.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
@@ -492,6 +494,93 @@ static void SiloDecodeFunction(DataChunk &args, ExpressionState &state, Vector &
 	Geometry::FromBinary(wkb_vec, result, args.size(), true);
 }
 
+// silo_metadata(blob) → STRUCT{geometry_type VARCHAR, vertex_type VARCHAR, scale BIGINT}
+static void SiloMetadataFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	static const char *geom_names[] = {"INVALID", "POINT", "LINESTRING", "POLYGON",
+	                                   "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON",
+	                                   "GEOMETRYCOLLECTION"};
+	static const char *vert_names[] = {"XY", "XYZ", "XYM", "XYZM"};
+
+	auto &blob_vec = args.data[0];
+	auto &entries = StructVector::GetEntries(result);
+	auto &geom_type_vec = *entries[0];
+	auto &vert_type_vec = *entries[1];
+	auto &scale_vec = *entries[2];
+
+	UnifiedVectorFormat blob_format;
+	blob_vec.ToUnifiedFormat(args.size(), blob_format);
+	auto blob_data = UnifiedVectorFormat::GetData<string_t>(blob_format);
+
+	auto &result_validity = FlatVector::Validity(result);
+
+	for (idx_t i = 0; i < args.size(); i++) {
+		auto blob_idx = blob_format.sel->get_index(i);
+		if (!blob_format.validity.RowIsValid(blob_idx)) {
+			result_validity.SetInvalid(i);
+			continue;
+		}
+		auto &blob = blob_data[blob_idx];
+		auto data = reinterpret_cast<const uint8_t *>(blob.GetData());
+		auto size = static_cast<idx_t>(blob.GetSize());
+		if (size < 14 || data[0] != GEOSILO_MAGIC) {
+			throw InvalidInputException("GeoSilo: invalid blob");
+		}
+
+		auto gt = data[2];
+		auto vt = data[3];
+		int64_t scale;
+		memcpy(&scale, data + 4, 8);
+
+		FlatVector::GetData<string_t>(geom_type_vec)[i] =
+		    StringVector::AddString(geom_type_vec, (gt <= 7) ? geom_names[gt] : "UNKNOWN");
+		FlatVector::GetData<string_t>(vert_type_vec)[i] =
+		    StringVector::AddString(vert_type_vec, (vt <= 3) ? vert_names[vt] : "UNKNOWN");
+		FlatVector::GetData<int64_t>(scale_vec)[i] = scale;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Arrow extension type: "queryfarm.geosilo"
+// ---------------------------------------------------------------------------
+// When an Arrow column is tagged with ARROW:extension:name = "queryfarm.geosilo",
+// DuckDB automatically decodes silo blobs to GEOMETRY on read, and encodes
+// GEOMETRY to silo blobs on write.
+
+struct ArrowGeoSilo {
+	// Arrow → DuckDB: silo blob → GEOMETRY
+	static void ArrowToDuck(ClientContext &context, Vector &source, Vector &result, idx_t count) {
+		Vector wkb_vec(LogicalType::BLOB, count);
+
+		UnaryExecutor::Execute<string_t, string_t>(source, wkb_vec, count, [&](string_t blob) {
+			SiloReader reader;
+			reader.Decode(reinterpret_cast<const uint8_t *>(blob.GetData()),
+			              static_cast<idx_t>(blob.GetSize()));
+			return reader.Finish(wkb_vec);
+		});
+
+		Geometry::FromBinary(wkb_vec, result, count, true);
+	}
+
+	// DuckDB → Arrow: GEOMETRY → silo blob
+	// Detects CRS on the source GEOMETRY type to pick the right scale.
+	static void DuckToArrow(ClientContext &context, Vector &source, Vector &result, idx_t count) {
+		int64_t scale = DEFAULT_SCALE;
+		if (source.GetType().id() == LogicalTypeId::GEOMETRY && GeoType::HasCRS(source.GetType())) {
+			scale = ScaleFromCRS(GeoType::GetCRS(source.GetType()));
+		}
+
+		Vector wkb_vec(LogicalType::BLOB, count);
+		Geometry::ToBinary(source, wkb_vec, count);
+
+		UnaryExecutor::Execute<string_t, string_t>(wkb_vec, result, count, [&](string_t wkb) {
+			SiloWriter writer(scale);
+			writer.EncodeWKB(reinterpret_cast<const uint8_t *>(wkb.GetData()),
+			                 static_cast<idx_t>(wkb.GetSize()));
+			return writer.Finish(result);
+		});
+	}
+};
+
 // ---------------------------------------------------------------------------
 // Extension loading
 // ---------------------------------------------------------------------------
@@ -510,6 +599,29 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// silo_decode(BLOB) → GEOMETRY
 	auto decode_fn = ScalarFunction("silo_decode", {LogicalType::BLOB}, LogicalType::GEOMETRY(), SiloDecodeFunction);
 	loader.RegisterFunction(decode_fn);
+
+	// silo_metadata(BLOB) → STRUCT{geometry_type VARCHAR, vertex_type VARCHAR, scale BIGINT}
+	auto meta_type = LogicalType::STRUCT({
+	    {"geometry_type", LogicalType::VARCHAR},
+	    {"vertex_type", LogicalType::VARCHAR},
+	    {"scale", LogicalType::BIGINT},
+	});
+	auto meta_fn = ScalarFunction("silo_metadata", {LogicalType::BLOB}, meta_type, SiloMetadataFunction);
+	loader.RegisterFunction(meta_fn);
+
+	// Register "queryfarm.geosilo" Arrow extension type
+	// When Arrow IPC data arrives with ARROW:extension:name = "queryfarm.geosilo",
+	// the BLOB data is automatically decoded to GEOMETRY.
+	// When DuckDB exports GEOMETRY to Arrow with this extension, it encodes to silo blobs.
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	try {
+		config.RegisterArrowExtension(
+		    {"queryfarm.geosilo", nullptr, nullptr,
+		     make_shared_ptr<ArrowTypeExtensionData>(LogicalType::GEOMETRY(), LogicalType::BLOB,
+		                                             ArrowGeoSilo::ArrowToDuck, ArrowGeoSilo::DuckToArrow)});
+	} catch (...) {
+		// Already registered (e.g., multiple LOAD calls)
+	}
 }
 
 void GeosiloExtension::Load(ExtensionLoader &loader) {
