@@ -374,22 +374,40 @@ GeoSilo: unsupported version
 # ---------------------------------------------------------------------------
 # Scale auto-detection from CRS
 # ---------------------------------------------------------------------------
-# Note: DuckDB's spatial extension does not yet propagate CRS to the GEOMETRY
-# LogicalType (ST_Transform returns plain GEOMETRY). Once it does, silo_encode
-# will auto-detect scale from CRS. For now, verify explicit scale roundtrips
-# preserve the scale in the blob header.
 
-# Default scale (1e7) for WGS84-range coordinates
+# WGS84 CRS → scale 1e7
+statement ok
+CREATE TABLE t_wgs AS SELECT ST_SetCRS(ST_GeomFromText('POINT(1 2)'), 'EPSG:4326') AS geom;
+
+query I
+SELECT (silo_metadata(silo_encode(geom))).scale FROM t_wgs;
+----
+10000000
+
+# UTM CRS → scale 100
+statement ok
+CREATE TABLE t_utm AS SELECT ST_SetCRS(ST_GeomFromText('POINT(500000 4500000)'), 'EPSG:32618') AS geom;
+
+query I
+SELECT (silo_metadata(silo_encode(geom))).scale FROM t_utm;
+----
+100
+
+# UTM roundtrip — auto-detected scale
+query I
+SELECT ST_AsText(silo_decode(silo_encode(geom))) FROM t_utm;
+----
+POINT (500000 4500000)
+
+# No CRS → default scale 1e7
 query I
 SELECT (silo_metadata(silo_encode(ST_GeomFromText('POINT(1 2)')))).scale;
 ----
 10000000
 
-# Explicit scale 100 (projected CRS)
-query I
-SELECT (silo_metadata(silo_encode(ST_GeomFromText('POINT(500000 4500000)'), 100))).scale;
-----
-100
+# ---------------------------------------------------------------------------
+# Explicit scale overrides CRS
+# ---------------------------------------------------------------------------
 
 # Explicit scale 30 (US survey feet)
 query I
@@ -397,14 +415,13 @@ SELECT (silo_metadata(silo_encode(ST_GeomFromText('POINT(1000000 500000)'), 30))
 ----
 30
 
-# Scale roundtrip: decode uses the scale stored in the blob, not a global default
+# Explicit scale roundtrip
 query I
 SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(500000 4500000)'), 100)));
 ----
 POINT (500000 4500000)
 
-# Same point encoded with different scales produces different decoded values
-# (because quantization differs)
+# Different scales produce different quantization
 query I
 SELECT ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(1.23456789 2.34567891)'), 100)))
     != ST_AsText(silo_decode(silo_encode(ST_GeomFromText('POINT(1.23456789 2.34567891)'), 10000000)));
