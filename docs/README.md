@@ -1,4 +1,4 @@
-# GeoSilo
+# GeoSilo by [Query.Farm](https://query.farm)
 
 A DuckDB extension for compact geometry encoding. Delta-encodes coordinates as scaled integers instead of float64 pairs, achieving **3-4x smaller** geometry on disk and over the wire compared to standard WKB.
 
