@@ -1,6 +1,6 @@
 # GeoSilo by [Query.Farm](https://query.farm)
 
-A DuckDB extension for compact geometry encoding. Delta-encodes coordinates as scaled integers instead of float64 pairs, achieving **3-4x smaller** geometry on disk and over the wire compared to standard WKB.
+A DuckDB extension for compact geometry encoding. Delta-encodes coordinates as scaled integers instead of float64 pairs, achieving **3–4x smaller** geometry on disk and over the wire compared to standard WKB. Points compress to just **9 bytes** (vs 21 bytes WKB).
 
 ```sql
 INSTALL spatial; LOAD spatial;
@@ -27,8 +27,11 @@ GeoSilo exploits this spatial adjacency:
 2. Store the first coordinate per ring as absolute int32
 3. Store subsequent coordinates as **int16 deltas** from the previous value
 4. ~90% of deltas fit in 2 bytes; the remaining ~10% use a 6-byte escape
+5. **Points** use a 1-byte compact header (vs 12-byte full header), totaling just 9 bytes
+6. **Polygon rings** omit the closing vertex (reconstructed on decode)
+7. **MULTIPOINT** delta-encodes between sub-points
 
-The result is ~70% smaller raw blobs that compress 3-4x better with ZSTD because small integer deltas have highly repetitive byte patterns.
+The result is ~70% smaller raw blobs that compress 3–4x better with ZSTD because small integer deltas have highly repetitive byte patterns.
 
 ## Functions
 
@@ -64,10 +67,10 @@ Geometry column compression vs standard WKB on US Census TIGER/Line 2025 (WGS84)
 
 | Table | Rows | WKB Size | GeoSilo | GeoSilo + ZSTD |
 |---|---|---|---|---|
-| block_group | 242,748 | 209 MB | 0.33x | 0.28x |
+| block_group | 242,748 | 209 MB | 0.31x | 0.27x |
 | zcta5 | 33,791 | 180 MB | 0.29x | 0.26x |
-| tract | 85,529 | 125 MB | 0.32x | 0.27x |
-| county | 3,235 | 25 MB | 0.31x | 0.27x |
+| tract | 85,529 | 125 MB | 0.30x | 0.27x |
+| county | 3,235 | 25 MB | 0.30x | 0.27x |
 | urban_area | 2,644 | 23 MB | 0.29x | 0.26x |
 
 Reproduce with: `./build/release/duckdb -f scripts/benchmark.sql` (requires `tiger.duckdb` in the working directory).
@@ -159,10 +162,22 @@ geom_field = pa.field("geom", pa.binary(), metadata={
 
 ## Binary format
 
+Each blob uses either a **compact header** (1 byte) or a **full header** (12 bytes):
+
 ```
-Header (14 bytes):
+Compact header (1 byte, 0x50–0x67):
+  A single magic byte encodes geometry type, vertex type, and scale.
+  Each geometry type gets 4 consecutive values:
+    base + 0 = XY,  scale 1e7
+    base + 1 = XYZ, scale 1e7
+    base + 2 = XY,  scale 100
+    base + 3 = XYZ, scale 100
+  POINT: 0x50–0x53, LINESTRING: 0x54–0x57, POLYGON: 0x58–0x5B,
+  MULTIPOINT: 0x5C–0x5F, MULTILINESTRING: 0x60–0x63, MULTIPOLYGON: 0x64–0x67
+
+Full header (12 bytes, magic 0x47):
   magic            1 byte   0x47 ('G')
-  version          1 byte   0x01
+  version          1 byte   (0x01–0x03)
   geometry_type    1 byte   (1=Point .. 7=GeometryCollection)
   vertex_type      1 byte   (0=XY, 1=XYZ, 2=XYM, 3=XYZM)
   scale            8 bytes  int64 LE
@@ -173,11 +188,20 @@ Coordinates:
   Empty (NaN):     INT32_MAX sentinel per dimension
 
 Body (recursive):
-  Point:           D absolute int32 values
+  Point:           D absolute int32 values (9 bytes total with compact header)
   LineString:      uint32 num_points + delta-encoded coordinates
   Polygon:         uint32 num_rings, each: uint32 num_points + delta coords
+                   (v3/compact: closing vertex omitted, reconstructed on decode)
+  MultiPoint:      uint32 num_parts + delta-encoded points
+                   (v2+/compact: first absolute, rest delta-encoded)
   Multi*:          uint32 num_parts, each part recursively
   Collection:      uint32 num_parts, each with type byte + recursive body
+
+Version history:
+  v1: Original encoding
+  v2: MULTIPOINT delta encoding between sub-points
+  v3: Polygon ring closure elimination
+  Compact headers always use the latest features for their geometry type.
 ```
 
 
