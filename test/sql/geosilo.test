@@ -644,3 +644,172 @@ SELECT count(*) FROM (
 ) WHERE ST_NPoints(decoded) = 5;
 ----
 1000
+
+# ---------------------------------------------------------------------------
+# GEOSILO custom type
+# ---------------------------------------------------------------------------
+
+# Create table with GEOSILO type and CRS
+statement ok
+CREATE TABLE gs_typed (id INTEGER, geom GEOSILO('EPSG:4326'));
+
+# INSERT from GEOMETRY (implicit cast)
+statement ok
+INSERT INTO gs_typed VALUES (1, ST_Point(1.0, 2.0));
+
+statement ok
+INSERT INTO gs_typed VALUES (2, ST_GeomFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))'));
+
+statement ok
+INSERT INTO gs_typed VALUES (3, ST_GeomFromText('POINT EMPTY'));
+
+# typeof shows GEOSILO with CRS
+query I
+SELECT typeof(geom) FROM gs_typed LIMIT 1;
+----
+GEOSILO(EPSG:4326, 10000000)
+
+# GEOSILO without CRS
+statement ok
+CREATE TABLE gs_default (geom GEOSILO);
+
+statement ok
+INSERT INTO gs_default VALUES (ST_Point(42.0, -73.0));
+
+query I
+SELECT typeof(geom) FROM gs_default;
+----
+GEOSILO
+
+# ---------------------------------------------------------------------------
+# GEOSILO implicit cast to GEOMETRY (ST_* functions work transparently)
+# ---------------------------------------------------------------------------
+
+# ST_AsText via implicit cast
+query I
+SELECT ST_AsText(geom) FROM gs_typed WHERE id = 1;
+----
+POINT (1 2)
+
+# ST_Area via implicit cast
+query I
+SELECT ST_Area(geom) FROM gs_typed WHERE id = 2;
+----
+100.0
+
+# ST_AsText on polygon via implicit cast
+query I
+SELECT ST_AsText(geom) FROM gs_typed WHERE id = 2;
+----
+POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))
+
+# ---------------------------------------------------------------------------
+# Direct ST_* overloads on GEOSILO (no decode)
+# ---------------------------------------------------------------------------
+
+# ST_GeometryType
+query II
+SELECT id, ST_GeometryType(geom) FROM gs_typed WHERE id <= 2 ORDER BY id;
+----
+1	POINT
+2	POLYGON
+
+# ST_IsEmpty
+query II
+SELECT id, ST_IsEmpty(geom) FROM gs_typed ORDER BY id;
+----
+1	false
+2	false
+3	true
+
+# ST_NPoints
+query II
+SELECT id, ST_NPoints(geom) FROM gs_typed WHERE id <= 2 ORDER BY id;
+----
+1	1
+2	5
+
+# ST_X / ST_Y on POINT
+query II
+SELECT ST_X(geom), ST_Y(geom) FROM gs_typed WHERE id = 1;
+----
+1.0	2.0
+
+# ST_X / ST_Y on default GEOSILO
+query II
+SELECT ST_X(geom), ST_Y(geom) FROM gs_default;
+----
+42.0	-73.0
+
+# VARCHAR cast (display)
+query I
+SELECT geom::VARCHAR FROM gs_typed WHERE id = 1;
+----
+POINT (1 2)
+
+# Explicit decode still works
+query I
+SELECT ST_AsText(geosilo_decode(geom)) FROM gs_typed WHERE id = 1;
+----
+POINT (1 2)
+
+# geosilo_metadata on GEOSILO type
+query III
+SELECT m.geometry_type, m.vertex_type, m.scale
+FROM (SELECT geosilo_metadata(geom) AS m FROM gs_typed WHERE id = 1);
+----
+POINT	XY	10000000
+
+# ---------------------------------------------------------------------------
+# Phase 3: Bounding box (direct, no decode)
+# ---------------------------------------------------------------------------
+
+# POINT bbox = point itself
+query IIII
+SELECT ST_XMin(geom), ST_XMax(geom), ST_YMin(geom), ST_YMax(geom) FROM gs_typed WHERE id = 1;
+----
+1.0	1.0	2.0	2.0
+
+# POLYGON bbox
+query IIII
+SELECT ST_XMin(geom), ST_XMax(geom), ST_YMin(geom), ST_YMax(geom) FROM gs_typed WHERE id = 2;
+----
+0.0	10.0	0.0	10.0
+
+# ---------------------------------------------------------------------------
+# Phase 4: ST_Area, ST_Length, ST_Perimeter (direct, no decode)
+# ---------------------------------------------------------------------------
+
+# POINT area = 0
+query I
+SELECT ST_Area(geom) FROM gs_typed WHERE id = 1;
+----
+0.0
+
+# POLYGON area = 100 (10x10 square)
+query I
+SELECT round(ST_Area(geom), 1) FROM gs_typed WHERE id = 2;
+----
+100.0
+
+# LINESTRING length
+statement ok
+INSERT INTO gs_typed VALUES (4, ST_GeomFromText('LINESTRING(0 0, 3 4)'));
+
+query I
+SELECT ST_Length(geom) FROM gs_typed WHERE id = 4;
+----
+5.0
+
+# POLYGON perimeter = 40 (10+10+10+10)
+query I
+SELECT round(ST_Perimeter(geom), 1) FROM gs_typed WHERE id = 2;
+----
+40.0
+
+# Cleanup
+statement ok
+DROP TABLE gs_typed;
+
+statement ok
+DROP TABLE gs_default;

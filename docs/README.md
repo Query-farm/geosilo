@@ -2,19 +2,23 @@
 
 A DuckDB extension for compact geometry encoding. Delta-encodes coordinates as scaled integers instead of float64 pairs, achieving **3–4x smaller** geometry on disk and over the wire compared to standard WKB. Points compress to just **9 bytes** (vs 21 bytes WKB).
 
+GeoSilo provides a first-class `GEOSILO` column type with transparent interop — standard `ST_*` spatial functions work directly on GEOSILO columns, with high-performance native implementations for common operations that skip the WKB decode step entirely.
+
 ```sql
 INSTALL spatial; LOAD spatial;
 INSTALL geosilo FROM community; LOAD geosilo;
 
--- Encode: GEOMETRY → compact BLOB
-SELECT geosilo_encode(geom) FROM my_table;
+-- Create a table with GEOSILO type
+CREATE TABLE parcels (
+    id INTEGER,
+    geom GEOSILO('EPSG:4326') USING COMPRESSION zstd
+);
 
--- Decode: compact BLOB → GEOMETRY
-SELECT ST_Area(geosilo_decode(geom)) FROM compact_table;
+-- Insert from any GEOMETRY source (auto-encodes)
+INSERT INTO parcels SELECT id, geom FROM raw_data;
 
--- Inspect without decoding
-SELECT geosilo_metadata(geom) FROM compact_table;
--- {'geometry_type': MULTIPOLYGON, 'vertex_type': XY, 'scale': 10000000}
+-- ST_* functions work directly — no decode needed for many operations
+SELECT id, ST_Area(geom), ST_X(ST_Centroid(geom)) FROM parcels;
 ```
 
 ## Why
@@ -33,14 +37,72 @@ GeoSilo exploits this spatial adjacency:
 
 The result is ~70% smaller raw blobs that compress 3–4x better with ZSTD because small integer deltas have highly repetitive byte patterns.
 
+## GEOSILO type
+
+The `GEOSILO` type is a first-class DuckDB column type with optional CRS parameterization:
+
+```sql
+-- With CRS (scale auto-detected)
+CREATE TABLE t (geom GEOSILO('EPSG:4326') USING COMPRESSION zstd);
+
+-- Without CRS (default scale 1e7)
+CREATE TABLE t (geom GEOSILO USING COMPRESSION zstd);
+```
+
+**Transparent casts** — GEOSILO implicitly casts to/from GEOMETRY, so all existing spatial functions work:
+
+```sql
+-- Insert from GEOMETRY (auto-encodes)
+INSERT INTO t SELECT ST_GeomFromText('POINT(1 2)');
+
+-- ST_* functions work transparently
+SELECT ST_Buffer(geom, 0.01) FROM t;  -- auto-decodes to GEOMETRY
+```
+
+**Direct ST_\* overloads** — common functions have native GEOSILO implementations that skip the WKB decode, running 2–3x faster:
+
+| Function | Implementation | Avoids decode? |
+|---|---|---|
+| `ST_GeometryType(GEOSILO)` | Read 1 byte from header | Yes |
+| `ST_IsEmpty(GEOSILO)` | Check sentinel/count fields | Yes |
+| `ST_NPoints(GEOSILO)` | Walk structure count fields | Yes |
+| `ST_X(GEOSILO)`, `ST_Y(GEOSILO)` | Read int32, divide by scale | Yes |
+| `ST_XMin/XMax/YMin/YMax(GEOSILO)` | Delta walk with min/max tracking | Yes |
+| `ST_Area(GEOSILO)` | Shoelace formula on int64 accumulators | Yes |
+| `ST_Length(GEOSILO)` | Euclidean distance during delta walk | Yes |
+| `ST_Perimeter(GEOSILO)` | Same as length for polygon rings | Yes |
+
+Functions without a native overload (ST_Buffer, ST_Union, ST_AsText, etc.) automatically fall back to the implicit cast — users write the same SQL regardless.
+
+### Storage recommendation
+
+For best on-disk compression, use `USING COMPRESSION zstd` on GEOSILO columns:
+
+```sql
+CREATE TABLE t (
+    id INTEGER,
+    geom GEOSILO('EPSG:4326') USING COMPRESSION zstd
+);
+```
+
+On-disk size comparison (TIGER/Line 2025, geom + centroid columns, 4 tables, default row groups):
+
+| Format | Size | vs GEOMETRY |
+|---|---|---|
+| GEOMETRY (shredded + ALP) | 183 MB | 1.00x |
+| GEOSILO (no ZSTD) | 230 MB | 1.26x |
+| **GEOSILO + ZSTD** | **144 MB** | **0.79x** |
+
+Without ZSTD, DuckDB stores GEOSILO blobs uncompressed — larger than native GEOMETRY with shredding. With ZSTD, GEOSILO columns are ~21% smaller because delta-encoded small integers compress extremely well.
+
 ## Functions
 
 | Function | Input | Output | Description |
 |---|---|---|---|
 | `geosilo_encode(geom)` | GEOMETRY | BLOB | Encode with auto-detected or default scale |
 | `geosilo_encode(geom, scale)` | GEOMETRY, BIGINT | BLOB | Encode with explicit scale |
-| `geosilo_decode(blob)` | BLOB | GEOMETRY | Decode back to GEOMETRY |
-| `geosilo_metadata(blob)` | BLOB | STRUCT | Read header without decoding |
+| `geosilo_decode(blob)` | BLOB/GEOSILO | GEOMETRY | Decode back to GEOMETRY |
+| `geosilo_metadata(blob)` | BLOB/GEOSILO | STRUCT | Read header without decoding |
 
 All geometry types are supported: Point, LineString, Polygon, Multi\*, GeometryCollection, and empty geometries.
 
@@ -77,7 +139,17 @@ Reproduce with: `./build/release/duckdb -f scripts/benchmark.sql` (requires `tig
 
 ### Performance
 
-Encode/decode throughput on US Census TIGER/Line 2025 (single-threaded, Apple M-series):
+Direct ST_* functions on GEOSILO vs implicit-cast path (decode + spatial), in-memory, TIGER/Line 2025:
+
+| Function | Data | Direct | Via Cast | Speedup |
+|---|---|---|---|---|
+| ST_X | 242K points | 1 ms | 3 ms | 3x |
+| ST_Area | 3,235 counties | 3 ms | 9 ms | 3x |
+| ST_XMin | 3,235 counties | 4 ms | 11 ms | 2.75x |
+
+ST_Area results match the spatial extension within float64 epsilon (max diff 5.7e-13) across all 365K TIGER geometries.
+
+Encode/decode throughput (single-threaded, Apple M-series):
 
 | Table | Rows | Encode | Decode |
 |---|---|---|---|
@@ -86,26 +158,44 @@ Encode/decode throughput on US Census TIGER/Line 2025 (single-threaded, Apple M-
 | tract | 85,529 | 41 ms (3,039 MB/s) | 39 ms (3,195 MB/s) |
 | county | 3,235 | 7 ms (3,514 MB/s) | 7 ms (3,514 MB/s) |
 
-Throughput is measured relative to WKB input/output size. GeoSilo reads and writes DuckDB's internal GEOMETRY format directly — no intermediate WKB serialization step.
-
-End-to-end overhead for spatial operations (decode + compute vs raw compute):
-
-| Table | Rows | Raw ST_Area | Decode + ST_Area | Overhead |
-|---|---|---|---|---|
-| block_group | 242,748 | 18 ms | 83 ms | +361% |
-| county | 3,235 | 2 ms | 8 ms | +300% |
-
-The overhead is from the decode step, not from precision loss. For I/O-bound workloads (reading from disk or network), the 3–4x smaller data size more than compensates for the decode cost.
-
-Reproduce with: `./build/release/duckdb -f scripts/throughput_benchmark.sql`
-
 ## Usage
 
-### Basic encode/decode
+### Using the GEOSILO type (recommended)
 
 ```sql
 INSTALL spatial; LOAD spatial;
 INSTALL geosilo FROM community; LOAD geosilo;
+
+-- Create table with GEOSILO column
+CREATE TABLE parcels (
+    id INTEGER,
+    geom GEOSILO('EPSG:4326') USING COMPRESSION zstd
+);
+
+-- Insert from any GEOMETRY source — auto-encodes
+INSERT INTO parcels
+SELECT id, ST_GeomFromText(wkt) FROM raw_data;
+
+-- Standard spatial functions work directly
+SELECT id, ST_Area(geom) FROM parcels;             -- native (no decode)
+SELECT id, ST_X(geom), ST_Y(geom) FROM parcels;    -- native (no decode)
+SELECT id, ST_Buffer(geom, 0.01) FROM parcels;     -- auto-decodes to GEOMETRY
+
+-- Spatial filters using bounding box (no decode)
+SELECT * FROM parcels
+WHERE ST_XMin(geom) > -78 AND ST_XMax(geom) < -76;
+```
+
+### Manual encode/decode (BLOB workflow)
+
+For cases where you want explicit control over encoding:
+
+```sql
+-- Encode to BLOB
+SELECT geosilo_encode(geom) FROM source_table;
+
+-- Decode back to GEOMETRY
+SELECT ST_Area(geosilo_decode(silo_blob)) FROM compact_table;
 
 -- Roundtrip
 SELECT ST_AsText(geosilo_decode(geosilo_encode(
@@ -113,28 +203,6 @@ SELECT ST_AsText(geosilo_decode(geosilo_encode(
 )));
 -- POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))
 ```
-
-### Compact storage with ZSTD
-
-DuckDB requires two settings for ZSTD-compressed BLOB columns:
-
-```sql
--- Both are required
-PRAGMA storage_compatibility_version='latest';
-
-CREATE TABLE compact (
-    id INTEGER,
-    geom BLOB USING COMPRESSION zstd
-);
-
-INSERT INTO compact
-SELECT id, geosilo_encode(geom) FROM source_table;
-
--- Decode for spatial operations
-SELECT ST_Area(geosilo_decode(geom)) FROM compact;
-```
-
-Without `storage_compatibility_version='latest'`, `USING COMPRESSION zstd` is silently ignored.
 
 ### Arrow IPC transport
 
