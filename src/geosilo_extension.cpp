@@ -1548,70 +1548,197 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterCastFunction(geosilo_type, LogicalType::VARCHAR,
 	                            BoundCastInfo(GeoSiloToVarcharCast), 10000);
 
-	// --- Existing functions (accept both BLOB and GEOSILO) ---
+	// --- geosilo_encode (overloaded: with and without scale) ---
+	ScalarFunctionSet encode_set("geosilo_encode");
+	encode_set.AddFunction(ScalarFunction("geosilo_encode", {LogicalType::GEOMETRY()}, LogicalType::BLOB,
+	                                      SiloEncodeFunction, SiloEncodeBind));
+	encode_set.AddFunction(ScalarFunction("geosilo_encode", {LogicalType::GEOMETRY(), LogicalType::BIGINT},
+	                                      LogicalType::BLOB, SiloEncodeWithScaleFunction, SiloEncodeWithScaleBind));
+	CreateScalarFunctionInfo encode_info(std::move(encode_set));
+	encode_info.descriptions.push_back({
+	    {LogicalType::GEOMETRY()},
+	    {"geometry"},
+	    "Encodes a GEOMETRY value into the compact GEOSILO binary format. "
+	    "When the GEOMETRY carries CRS metadata, an appropriate integer scale is derived from the CRS (e.g. degree-based CRSes get higher precision than projected meter-based ones); otherwise a default scale of 10,000,000 (1e7) is used. "
+	    "Returns a BLOB; cast to GEOSILO (or use directly anywhere GEOSILO is accepted) to retain typed metadata.",
+	    {"geosilo_encode(ST_Point(1, 2))",
+	     "geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'))"},
+	    {"geosilo", "geometry", "encoding"}
+	});
+	encode_info.descriptions.push_back({
+	    {LogicalType::GEOMETRY(), LogicalType::BIGINT},
+	    {"geometry", "scale"},
+	    "Encodes a GEOMETRY into GEOSILO using a caller-supplied integer scale. Each coordinate is multiplied by `scale` and rounded to int64 before delta-encoding, "
+	    "so a scale of 1e6 keeps 6 decimal digits of precision, 1e7 keeps 7, etc. "
+	    "Larger scales preserve more precision; encoding fails if any scaled coordinate overflows int64.",
+	    {"geosilo_encode(ST_Point(1.234, 5.678), 1000000)",
+	     "geosilo_encode(geom, 100)"},
+	    {"geosilo", "geometry", "encoding"}
+	});
+	loader.RegisterFunction(encode_info);
 
-	// geosilo_encode(GEOMETRY) → BLOB
-	auto encode_fn = ScalarFunction("geosilo_encode", {LogicalType::GEOMETRY()}, LogicalType::BLOB,
-	                                SiloEncodeFunction, SiloEncodeBind);
-	loader.RegisterFunction(encode_fn);
+	// --- geosilo_decode (accepts GEOSILO or BLOB) ---
+	ScalarFunctionSet decode_set("geosilo_decode");
+	decode_set.AddFunction(ScalarFunction("geosilo_decode", {geosilo_type}, LogicalType::GEOMETRY(), SiloDecodeFunction));
+	decode_set.AddFunction(ScalarFunction("geosilo_decode", {LogicalType::BLOB}, LogicalType::GEOMETRY(), SiloDecodeFunction));
+	CreateScalarFunctionInfo decode_info(std::move(decode_set));
+	decode_info.descriptions.push_back({
+	    {geosilo_type},
+	    {"geom"},
+	    "Decodes a GEOSILO value back into a DuckDB GEOMETRY. "
+	    "Round-trips losslessly when the original was encoded at sufficient scale.",
+	    {"geosilo_decode(geosilo_encode(ST_Point(1, 2)))",
+	     "SELECT geosilo_decode(silo_col) FROM t"},
+	    {"geosilo", "geometry", "encoding"}
+	});
+	decode_info.descriptions.push_back({
+	    {LogicalType::BLOB},
+	    {"blob"},
+	    "Decodes a raw GEOSILO-formatted BLOB into a GEOMETRY. "
+	    "Provided for backward compatibility with values stored as BLOB rather than the GEOSILO type.",
+	    {"geosilo_decode(blob_col)"},
+	    {"geosilo", "geometry", "encoding"}
+	});
+	loader.RegisterFunction(decode_info);
 
-	// geosilo_encode(GEOMETRY, BIGINT) → BLOB
-	auto encode_scale_fn = ScalarFunction("geosilo_encode", {LogicalType::GEOMETRY(), LogicalType::BIGINT},
-	                                      LogicalType::BLOB, SiloEncodeWithScaleFunction, SiloEncodeWithScaleBind);
-	loader.RegisterFunction(encode_scale_fn);
-
-	// geosilo_decode(GEOSILO) → GEOMETRY
-	auto decode_fn = ScalarFunction("geosilo_decode", {geosilo_type}, LogicalType::GEOMETRY(), SiloDecodeFunction);
-	loader.RegisterFunction(decode_fn);
-	// Also accept plain BLOB for backward compatibility
-	auto decode_blob_fn = ScalarFunction("geosilo_decode", {LogicalType::BLOB}, LogicalType::GEOMETRY(), SiloDecodeFunction);
-	loader.RegisterFunction(decode_blob_fn);
-
-	// geosilo_metadata(GEOSILO) → STRUCT
+	// --- geosilo_metadata (accepts GEOSILO or BLOB) ---
 	auto meta_type = LogicalType::STRUCT({
 	    {"geometry_type", LogicalType::VARCHAR},
 	    {"vertex_type", LogicalType::VARCHAR},
 	    {"scale", LogicalType::BIGINT},
 	});
-	auto meta_fn = ScalarFunction("geosilo_metadata", {geosilo_type}, meta_type, SiloMetadataFunction);
-	loader.RegisterFunction(meta_fn);
-	// Also accept plain BLOB
-	auto meta_blob_fn = ScalarFunction("geosilo_metadata", {LogicalType::BLOB}, meta_type, SiloMetadataFunction);
-	loader.RegisterFunction(meta_blob_fn);
+	ScalarFunctionSet metadata_set("geosilo_metadata");
+	metadata_set.AddFunction(ScalarFunction("geosilo_metadata", {geosilo_type}, meta_type, SiloMetadataFunction));
+	metadata_set.AddFunction(ScalarFunction("geosilo_metadata", {LogicalType::BLOB}, meta_type, SiloMetadataFunction));
+	CreateScalarFunctionInfo metadata_info(std::move(metadata_set));
+	const char *metadata_desc =
+	    "Reads the GEOSILO header without decoding the geometry. "
+	    "Returns a STRUCT with geometry_type (POINT, LINESTRING, ...), "
+	    "vertex_type (XY, XYZ, XYM, XYZM), and scale (the integer scale factor used at encode time).";
+	metadata_info.descriptions.push_back({
+	    {geosilo_type},
+	    {"geom"},
+	    metadata_desc,
+	    {"geosilo_metadata(geosilo_encode(ST_Point(1, 2)))"},
+	    {"geosilo", "metadata"}
+	});
+	metadata_info.descriptions.push_back({
+	    {LogicalType::BLOB},
+	    {"blob"},
+	    metadata_desc,
+	    {"geosilo_metadata(blob_col)"},
+	    {"geosilo", "metadata"}
+	});
+	loader.RegisterFunction(metadata_info);
 
 	// --- ST_* function overloads (direct on GEOSILO, no decode) ---
+	auto register_st = [&](const char *name, ScalarFunction fn, const char *param_name,
+	                       const char *desc, vector<string> examples, vector<string> categories) {
+		CreateScalarFunctionInfo info(std::move(fn));
+		info.descriptions.push_back({
+		    {geosilo_type},
+		    {param_name},
+		    desc,
+		    std::move(examples),
+		    std::move(categories)
+		});
+		loader.RegisterFunction(info);
+	};
 
 	// Phase 1: Metadata
-	loader.RegisterFunction(ScalarFunction("ST_GeometryType", {geosilo_type},
-	                                       LogicalType::VARCHAR, GeoSiloSTGeometryType));
-	loader.RegisterFunction(ScalarFunction("ST_IsEmpty", {geosilo_type},
-	                                       LogicalType::BOOLEAN, GeoSiloSTIsEmpty));
-	loader.RegisterFunction(ScalarFunction("ST_NPoints", {geosilo_type},
-	                                       LogicalType::INTEGER, GeoSiloSTNPoints));
+	register_st("ST_GeometryType",
+	    ScalarFunction("ST_GeometryType", {geosilo_type}, LogicalType::VARCHAR, GeoSiloSTGeometryType),
+	    "geom",
+	    "Returns the geometry type name (POINT, LINESTRING, POLYGON, MULTIPOINT, MULTILINESTRING, MULTIPOLYGON, GEOMETRYCOLLECTION) "
+	    "by reading the GEOSILO header — no full decode is performed.",
+	    {"ST_GeometryType(geosilo_encode(ST_Point(1, 2)))"},
+	    {"geosilo", "geometry", "spatial"});
+
+	register_st("ST_IsEmpty",
+	    ScalarFunction("ST_IsEmpty", {geosilo_type}, LogicalType::BOOLEAN, GeoSiloSTIsEmpty),
+	    "geom",
+	    "Returns true if the encoded geometry contains no coordinates. "
+	    "Reads only the header and the top-level vertex/part count.",
+	    {"ST_IsEmpty(geosilo_encode(ST_GeomFromText('POINT EMPTY')))"},
+	    {"geosilo", "geometry", "spatial"});
+
+	register_st("ST_NPoints",
+	    ScalarFunction("ST_NPoints", {geosilo_type}, LogicalType::INTEGER, GeoSiloSTNPoints),
+	    "geom",
+	    "Returns the total number of vertices in the encoded geometry, including all rings and sub-geometries.",
+	    {"ST_NPoints(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)')))"},
+	    {"geosilo", "geometry", "spatial"});
 
 	// Phase 2: POINT coordinate access
-	loader.RegisterFunction(ScalarFunction("ST_X", {geosilo_type},
-	                                       LogicalType::DOUBLE, GeoSiloSTX));
-	loader.RegisterFunction(ScalarFunction("ST_Y", {geosilo_type},
-	                                       LogicalType::DOUBLE, GeoSiloSTY));
+	register_st("ST_X",
+	    ScalarFunction("ST_X", {geosilo_type}, LogicalType::DOUBLE, GeoSiloSTX),
+	    "geom",
+	    "Returns the X coordinate of a POINT geometry. "
+	    "Returns NULL for non-POINT or empty geometries.",
+	    {"ST_X(geosilo_encode(ST_Point(1.5, 2.5)))"},
+	    {"geosilo", "geometry", "spatial"});
+
+	register_st("ST_Y",
+	    ScalarFunction("ST_Y", {geosilo_type}, LogicalType::DOUBLE, GeoSiloSTY),
+	    "geom",
+	    "Returns the Y coordinate of a POINT geometry. "
+	    "Returns NULL for non-POINT or empty geometries.",
+	    {"ST_Y(geosilo_encode(ST_Point(1.5, 2.5)))"},
+	    {"geosilo", "geometry", "spatial"});
 
 	// Phase 3: Bounding box
-	loader.RegisterFunction(ScalarFunction("ST_XMin", {geosilo_type},
-	                                       LogicalType::DOUBLE, GeoSiloSTXMin));
-	loader.RegisterFunction(ScalarFunction("ST_XMax", {geosilo_type},
-	                                       LogicalType::DOUBLE, GeoSiloSTXMax));
-	loader.RegisterFunction(ScalarFunction("ST_YMin", {geosilo_type},
-	                                       LogicalType::DOUBLE, GeoSiloSTYMin));
-	loader.RegisterFunction(ScalarFunction("ST_YMax", {geosilo_type},
-	                                       LogicalType::DOUBLE, GeoSiloSTYMax));
+	register_st("ST_XMin",
+	    ScalarFunction("ST_XMin", {geosilo_type}, LogicalType::DOUBLE, GeoSiloSTXMin),
+	    "geom",
+	    "Returns the minimum X coordinate of the geometry's bounding box.",
+	    {"ST_XMin(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)')))"},
+	    {"geosilo", "geometry", "spatial", "bbox"});
+
+	register_st("ST_XMax",
+	    ScalarFunction("ST_XMax", {geosilo_type}, LogicalType::DOUBLE, GeoSiloSTXMax),
+	    "geom",
+	    "Returns the maximum X coordinate of the geometry's bounding box.",
+	    {"ST_XMax(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)')))"},
+	    {"geosilo", "geometry", "spatial", "bbox"});
+
+	register_st("ST_YMin",
+	    ScalarFunction("ST_YMin", {geosilo_type}, LogicalType::DOUBLE, GeoSiloSTYMin),
+	    "geom",
+	    "Returns the minimum Y coordinate of the geometry's bounding box.",
+	    {"ST_YMin(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)')))"},
+	    {"geosilo", "geometry", "spatial", "bbox"});
+
+	register_st("ST_YMax",
+	    ScalarFunction("ST_YMax", {geosilo_type}, LogicalType::DOUBLE, GeoSiloSTYMax),
+	    "geom",
+	    "Returns the maximum Y coordinate of the geometry's bounding box.",
+	    {"ST_YMax(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)')))"},
+	    {"geosilo", "geometry", "spatial", "bbox"});
 
 	// Phase 4: Computational
-	loader.RegisterFunction(ScalarFunction("ST_Area", {geosilo_type},
-	                                       LogicalType::DOUBLE, GeoSiloSTArea));
-	loader.RegisterFunction(ScalarFunction("ST_Length", {geosilo_type},
-	                                       LogicalType::DOUBLE, GeoSiloSTLength));
-	loader.RegisterFunction(ScalarFunction("ST_Perimeter", {geosilo_type},
-	                                       LogicalType::DOUBLE, GeoSiloSTPerimeter));
+	register_st("ST_Area",
+	    ScalarFunction("ST_Area", {geosilo_type}, LogicalType::DOUBLE, GeoSiloSTArea),
+	    "geom",
+	    "Returns the planar area of a (MULTI)POLYGON geometry in the units of its coordinate system. "
+	    "Returns 0 for non-areal geometries.",
+	    {"ST_Area(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))')))"},
+	    {"geosilo", "geometry", "spatial"});
+
+	register_st("ST_Length",
+	    ScalarFunction("ST_Length", {geosilo_type}, LogicalType::DOUBLE, GeoSiloSTLength),
+	    "geom",
+	    "Returns the planar length of a (MULTI)LINESTRING in the units of its coordinate system. "
+	    "Returns 0 for non-linear geometries.",
+	    {"ST_Length(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 3 4)')))"},
+	    {"geosilo", "geometry", "spatial"});
+
+	register_st("ST_Perimeter",
+	    ScalarFunction("ST_Perimeter", {geosilo_type}, LogicalType::DOUBLE, GeoSiloSTPerimeter),
+	    "geom",
+	    "Returns the planar perimeter of a (MULTI)POLYGON, summed across all rings. "
+	    "Returns 0 for non-areal geometries.",
+	    {"ST_Perimeter(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))')))"},
+	    {"geosilo", "geometry", "spatial"});
 
 	// Register "queryfarm.geosilo" Arrow extension type
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
