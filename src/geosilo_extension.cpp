@@ -1635,6 +1635,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto register_st = [&](const char *name, ScalarFunction fn, const char *param_name,
 	                       const char *desc, vector<string> examples, vector<string> categories) {
 		CreateScalarFunctionInfo info(std::move(fn));
+		// Add the GEOSILO overload without replacing Spatial's existing overloads.
+		// The CreateScalarFunctionInfo overload does not set this policy for us.
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 		info.descriptions.push_back({
 		    {geosilo_type},
 		    {param_name},
