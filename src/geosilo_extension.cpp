@@ -1782,11 +1782,7 @@ std::string GeosiloExtension::Name() {
 }
 
 std::string GeosiloExtension::Version() const {
-#ifdef EXT_VERSION_GEOSILO
-	return EXT_VERSION_GEOSILO;
-#else
-	return "";
-#endif
+	return "2026102001";
 }
 
 } // namespace duckdb
