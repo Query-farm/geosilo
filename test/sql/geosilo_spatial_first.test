@@ -1,0 +1,56 @@
+# name: test/sql/geosilo_spatial_first.test
+# description: loading geosilo after spatial preserves all shared ST_* overloads
+# group: [geosilo]
+
+statement ok
+INSTALL spatial;
+
+statement ok
+LOAD spatial;
+
+require geosilo
+
+# Spatial's GEOMETRY overloads and GeoSilo's GEOSILO overloads must coexist.
+# The explicit casts ensure the binder exercises each overload independently.
+query IIIIIIIII
+WITH shapes AS (SELECT 'POINT(1 2)'::GEOMETRY AS g)
+SELECT ST_GeometryType(g) = ST_GeometryType(g::GEOSILO),
+       ST_IsEmpty(g) = ST_IsEmpty(g::GEOSILO),
+       ST_NPoints(g) = ST_NPoints(g::GEOSILO),
+       ST_X(g) = ST_X(g::GEOSILO), ST_Y(g) = ST_Y(g::GEOSILO),
+       ST_XMin(g) = ST_XMin(g::GEOSILO), ST_XMax(g) = ST_XMax(g::GEOSILO),
+       ST_YMin(g) = ST_YMin(g::GEOSILO), ST_YMax(g) = ST_YMax(g::GEOSILO)
+FROM shapes;
+----
+true	true	true	true	true	true	true	true	true
+
+query IIII
+WITH shapes AS (SELECT 'POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))'::GEOMETRY AS g)
+SELECT round(ST_Area(g), 10), round(ST_Area(g::GEOSILO), 10),
+       ST_Perimeter(g), ST_Perimeter(g::GEOSILO)
+FROM shapes;
+----
+12.0	12.0	14.0	14.0
+
+query II
+WITH shapes AS (SELECT 'LINESTRING(0 0, 3 4)'::GEOMETRY AS g)
+SELECT ST_Length(g), ST_Length(g::GEOSILO) FROM shapes;
+----
+5.0	5.0
+
+# Spatial-specific overloads and functions remain available too.
+query II
+SELECT ST_X({'x': 7, 'y': 8}::POINT_2D),
+       ST_AsText('POINT(1 2)'::GEOMETRY::GEOSILO);
+----
+7.0	POINT (1 2)
+
+# None of the twelve native overloads was silently discarded during merging.
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name IN ('ST_GeometryType', 'ST_IsEmpty', 'ST_NPoints', 'ST_X', 'ST_Y',
+                       'ST_XMin', 'ST_XMax', 'ST_YMin', 'ST_YMax', 'ST_Area',
+                       'ST_Length', 'ST_Perimeter')
+  AND parameter_types = ['GEOSILO'];
+----
+12
