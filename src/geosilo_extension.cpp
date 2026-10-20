@@ -5,6 +5,10 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/geometry.hpp"
 #include "duckdb/common/types/geometry_crs.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/common/vector/unified_vector_format.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/arrow_type_extension.hpp"
@@ -165,19 +169,14 @@ struct GeoSiloType {
 	}
 
 	static LogicalType Get(const string &crs, int64_t scale) {
-		auto type = LogicalType(LogicalTypeId::BLOB);
-		type.SetAlias("GEOSILO");
 		auto info = make_uniq<ExtensionTypeInfo>();
 		info->modifiers.emplace_back(Value(crs));
 		info->modifiers.emplace_back(Value::BIGINT(scale));
-		type.SetExtensionInfo(std::move(info));
-		return type;
+		return LogicalType(LogicalTypeId::BLOB).WithAlias("GEOSILO").WithExtensionInfo(std::move(info));
 	}
 
 	static LogicalType GetDefault() {
-		auto type = LogicalType(LogicalTypeId::BLOB);
-		type.SetAlias("GEOSILO");
-		return type;
+		return LogicalType(LogicalTypeId::BLOB).WithAlias("GEOSILO");
 	}
 
 	static bool IsGeoSilo(const LogicalType &type) {
@@ -984,18 +983,27 @@ private:
 // Bind functions
 // ---------------------------------------------------------------------------
 
-static unique_ptr<FunctionData> SiloEncodeBind(ClientContext &context, ScalarFunction &bound_function,
-                                               vector<unique_ptr<Expression>> &arguments) {
+static unique_ptr<FunctionData> SiloEncodeBind(BindScalarFunctionInput &input) {
 	int64_t scale = DEFAULT_SCALE;
-	auto &geom_type = arguments[0]->return_type;
+	auto &geom_type = input.GetArguments()[0]->GetReturnType();
 	if (geom_type.id() == LogicalTypeId::GEOMETRY && GeoType::HasCRS(geom_type)) {
 		scale = ScaleFromCRS(GeoType::GetCRS(geom_type));
 	}
 	return make_uniq<SiloEncodeBindData>(scale);
 }
 
-static unique_ptr<FunctionData> SiloEncodeWithScaleBind(ClientContext &context, ScalarFunction &bound_function,
-                                                        vector<unique_ptr<Expression>> &arguments) {
+// DuckDB 2.0 casts the arguments to the parameter types (plain GEOMETRY, without CRS) before the bind
+// callback runs. Propagate the argument's own GEOMETRY type into the bound function so the CRS survives
+// and SiloEncodeBind can derive the scale from it.
+static void SiloEncodeResolveTypes(ResolveScalarFunctionTypesInput &input) {
+	auto &argument_type = input.GetArgumentType(0);
+	if (argument_type.id() != LogicalTypeId::GEOMETRY) {
+		return;
+	}
+	input.GetBoundFunction().GetArguments()[0] = argument_type;
+}
+
+static unique_ptr<FunctionData> SiloEncodeWithScaleBind(BindScalarFunctionInput &input) {
 	return make_uniq<SiloEncodeBindData>(0); // sentinel — scale comes from runtime arg
 }
 
@@ -1007,13 +1015,13 @@ static unique_ptr<FunctionData> SiloEncodeWithScaleBind(ClientContext &context, 
 // DuckDB's internal GEOMETRY format IS WKB (ToBinary is a no-op Reinterpret),
 // so we read the GEOMETRY bytes directly without conversion.
 static void SiloEncodeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<SiloEncodeBindData>();
+	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<SiloEncodeBindData>();
 	int64_t scale = bind_data.scale;
 
 	auto &geom_vec = args.data[0];
 
 	SiloWriter writer(scale);
-	UnaryExecutor::Execute<string_t, string_t>(geom_vec, result, args.size(), [&](string_t geom) {
+	UnaryExecutor::Execute<string_t, string_t>(geom_vec, result, [&](string_t geom) {
 		return writer.Encode(reinterpret_cast<const uint8_t *>(geom.GetData()),
 		                     static_cast<idx_t>(geom.GetSize()), result);
 	});
@@ -1025,7 +1033,7 @@ static void SiloEncodeWithScaleFunction(DataChunk &args, ExpressionState &state,
 
 	SiloWriter writer(0);
 	BinaryExecutor::Execute<string_t, int64_t, string_t>(
-	    geom_vec, scale_vec, result, args.size(), [&](string_t geom, int64_t scale) {
+	    geom_vec, scale_vec, result, [&](string_t geom, int64_t scale) {
 		    writer.SetScale(scale);
 		    return writer.Encode(reinterpret_cast<const uint8_t *>(geom.GetData()),
 		                         static_cast<idx_t>(geom.GetSize()), result);
@@ -1039,7 +1047,7 @@ static void SiloDecodeFunction(DataChunk &args, ExpressionState &state, Vector &
 	auto &blob_vec = args.data[0];
 
 	SiloReader reader;
-	UnaryExecutor::Execute<string_t, string_t>(blob_vec, result, args.size(), [&](string_t blob) {
+	UnaryExecutor::Execute<string_t, string_t>(blob_vec, result, [&](string_t blob) {
 		return reader.Decode(reinterpret_cast<const uint8_t *>(blob.GetData()),
 		                     static_cast<idx_t>(blob.GetSize()), result);
 	});
@@ -1054,15 +1062,15 @@ static void SiloMetadataFunction(DataChunk &args, ExpressionState &state, Vector
 
 	auto &blob_vec = args.data[0];
 	auto &entries = StructVector::GetEntries(result);
-	auto &geom_type_vec = *entries[0];
-	auto &vert_type_vec = *entries[1];
-	auto &scale_vec = *entries[2];
+	auto &geom_type_vec = entries[0];
+	auto &vert_type_vec = entries[1];
+	auto &scale_vec = entries[2];
 
 	UnifiedVectorFormat blob_format;
-	blob_vec.ToUnifiedFormat(args.size(), blob_format);
+	blob_vec.ToUnifiedFormat(blob_format);
 	auto blob_data = UnifiedVectorFormat::GetData<string_t>(blob_format);
 
-	auto &result_validity = FlatVector::Validity(result);
+	auto &result_validity = FlatVector::ValidityMutable(result);
 
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto blob_idx = blob_format.sel->get_index(i);
@@ -1091,11 +1099,11 @@ static void SiloMetadataFunction(DataChunk &args, ExpressionState &state, Vector
 			throw InvalidInputException("GeoSilo: invalid blob");
 		}
 
-		FlatVector::GetData<string_t>(geom_type_vec)[i] =
+		FlatVector::GetDataMutable<string_t>(geom_type_vec)[i] =
 		    StringVector::AddString(geom_type_vec, (gt <= 7) ? geom_names[gt] : "UNKNOWN");
-		FlatVector::GetData<string_t>(vert_type_vec)[i] =
+		FlatVector::GetDataMutable<string_t>(vert_type_vec)[i] =
 		    StringVector::AddString(vert_type_vec, (vt <= 3) ? vert_names[vt] : "UNKNOWN");
-		FlatVector::GetData<int64_t>(scale_vec)[i] = scale;
+		FlatVector::GetDataMutable<int64_t>(scale_vec)[i] = scale;
 	}
 }
 
@@ -1174,7 +1182,7 @@ struct ArrowGeoSilo {
 	}
 
 	// DuckDB → Arrow: GEOMETRY → silo blob (direct, no WKB intermediate)
-	static void DuckToArrow(ClientContext &context, Vector &source, Vector &result, idx_t count) {
+	static void DuckToArrow(ClientContext &context, const Vector &source, Vector &result, idx_t count) {
 		int64_t scale = DEFAULT_SCALE;
 		if (source.GetType().id() == LogicalTypeId::GEOMETRY && GeoType::HasCRS(source.GetType())) {
 			scale = ScaleFromCRS(GeoType::GetCRS(source.GetType()));
@@ -1240,7 +1248,7 @@ static bool GeoSiloToVarcharCast(Vector &source, Vector &result, idx_t count, Ca
 	});
 	// Then convert GEOMETRY to WKT string
 	UnaryExecutor::Execute<string_t, string_t>(geom_vec, result, count, [&](string_t geom) {
-		return Geometry::ToString(result, geom);
+		return Geometry::ToString(StringVector::GetStringHeap(result), geom);
 	});
 	return true;
 }
@@ -1274,7 +1282,7 @@ static void GeoSiloSTGeometryType(DataChunk &args, ExpressionState &state, Vecto
 	                                   "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON",
 	                                   "GEOMETRYCOLLECTION"};
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, string_t>(blob_vec, result, args.size(), [&](string_t blob) {
+	UnaryExecutor::Execute<string_t, string_t>(blob_vec, result, [&](string_t blob) {
 		double unused;
 		auto gt = ParseSiloHeader(reinterpret_cast<const uint8_t *>(blob.GetData()),
 		                          static_cast<idx_t>(blob.GetSize()), unused);
@@ -1286,7 +1294,7 @@ static void GeoSiloSTGeometryType(DataChunk &args, ExpressionState &state, Vecto
 // ST_IsEmpty(GEOSILO) → BOOL
 static void GeoSiloSTIsEmpty(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, bool>(blob_vec, result, args.size(), [&](string_t blob) {
+	UnaryExecutor::Execute<string_t, bool>(blob_vec, result, [&](string_t blob) {
 		auto data = reinterpret_cast<const uint8_t *>(blob.GetData());
 		auto size = static_cast<idx_t>(blob.GetSize());
 		double inv_scale;
@@ -1313,7 +1321,7 @@ static void GeoSiloSTIsEmpty(DataChunk &args, ExpressionState &state, Vector &re
 // Walk the structure reading count fields, skip over coordinate data
 static void GeoSiloSTNPoints(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, int32_t>(blob_vec, result, args.size(), [&](string_t blob) -> int32_t {
+	UnaryExecutor::Execute<string_t, int32_t>(blob_vec, result, [&](string_t blob) -> int32_t {
 		auto data = reinterpret_cast<const uint8_t *>(blob.GetData());
 		auto size = static_cast<idx_t>(blob.GetSize());
 		double inv_scale;
@@ -1405,7 +1413,7 @@ static void GeoSiloSTNPoints(DataChunk &args, ExpressionState &state, Vector &re
 // ST_X(GEOSILO) → DOUBLE (POINT only)
 static void GeoSiloSTX(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, args.size(), [&](string_t blob) -> double {
+	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
 		auto data = reinterpret_cast<const uint8_t *>(blob.GetData());
 		auto size = static_cast<idx_t>(blob.GetSize());
 		double inv_scale;
@@ -1425,7 +1433,7 @@ static void GeoSiloSTX(DataChunk &args, ExpressionState &state, Vector &result) 
 // ST_Y(GEOSILO) → DOUBLE (POINT only)
 static void GeoSiloSTY(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, args.size(), [&](string_t blob) -> double {
+	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
 		auto data = reinterpret_cast<const uint8_t *>(blob.GetData());
 		auto size = static_cast<idx_t>(blob.GetSize());
 		double inv_scale;
@@ -1447,7 +1455,7 @@ static void GeoSiloSTY(DataChunk &args, ExpressionState &state, Vector &result) 
 
 static void GeoSiloSTXMin(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, args.size(), [&](string_t blob) -> double {
+	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
 		BBoxVisitor vis;
 		SiloWalker<BBoxVisitor> walker;
 		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
@@ -1458,7 +1466,7 @@ static void GeoSiloSTXMin(DataChunk &args, ExpressionState &state, Vector &resul
 
 static void GeoSiloSTXMax(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, args.size(), [&](string_t blob) -> double {
+	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
 		BBoxVisitor vis;
 		SiloWalker<BBoxVisitor> walker;
 		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
@@ -1469,7 +1477,7 @@ static void GeoSiloSTXMax(DataChunk &args, ExpressionState &state, Vector &resul
 
 static void GeoSiloSTYMin(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, args.size(), [&](string_t blob) -> double {
+	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
 		BBoxVisitor vis;
 		SiloWalker<BBoxVisitor> walker;
 		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
@@ -1480,7 +1488,7 @@ static void GeoSiloSTYMin(DataChunk &args, ExpressionState &state, Vector &resul
 
 static void GeoSiloSTYMax(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, args.size(), [&](string_t blob) -> double {
+	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
 		BBoxVisitor vis;
 		SiloWalker<BBoxVisitor> walker;
 		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
@@ -1493,7 +1501,7 @@ static void GeoSiloSTYMax(DataChunk &args, ExpressionState &state, Vector &resul
 
 static void GeoSiloSTArea(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, args.size(), [&](string_t blob) -> double {
+	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
 		AreaVisitor vis;
 		SiloWalker<AreaVisitor> walker;
 		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
@@ -1506,7 +1514,7 @@ static void GeoSiloSTArea(DataChunk &args, ExpressionState &state, Vector &resul
 
 static void GeoSiloSTLength(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, args.size(), [&](string_t blob) -> double {
+	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
 		LengthVisitor vis;
 		SiloWalker<LengthVisitor> walker;
 		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
@@ -1517,7 +1525,7 @@ static void GeoSiloSTLength(DataChunk &args, ExpressionState &state, Vector &res
 
 static void GeoSiloSTPerimeter(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, args.size(), [&](string_t blob) -> double {
+	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
 		// Perimeter is the same as length for polygon rings (including closure)
 		LengthVisitor vis;
 		SiloWalker<LengthVisitor> walker;
@@ -1550,10 +1558,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// --- geosilo_encode (overloaded: with and without scale) ---
 	ScalarFunctionSet encode_set("geosilo_encode");
-	encode_set.AddFunction(ScalarFunction("geosilo_encode", {LogicalType::GEOMETRY()}, LogicalType::BLOB,
-	                                      SiloEncodeFunction, SiloEncodeBind));
+	ScalarFunction encode_fn("geosilo_encode", {LogicalType::GEOMETRY()}, LogicalType::BLOB, SiloEncodeFunction,
+	                         SiloEncodeBind);
+	encode_fn.SetResolveTypesCallback(SiloEncodeResolveTypes);
+	encode_set.AddFunction(encode_fn);
 	encode_set.AddFunction(ScalarFunction("geosilo_encode", {LogicalType::GEOMETRY(), LogicalType::BIGINT},
 	                                      LogicalType::BLOB, SiloEncodeWithScaleFunction, SiloEncodeWithScaleBind));
+	// Can throw on invalid input (bad blob, coordinate overflow, unsupported geometry type)
+	encode_set.SetFallible();
 	CreateScalarFunctionInfo encode_info(std::move(encode_set));
 	encode_info.descriptions.push_back({
 	    {LogicalType::GEOMETRY()},
@@ -1581,6 +1593,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunctionSet decode_set("geosilo_decode");
 	decode_set.AddFunction(ScalarFunction("geosilo_decode", {geosilo_type}, LogicalType::GEOMETRY(), SiloDecodeFunction));
 	decode_set.AddFunction(ScalarFunction("geosilo_decode", {LogicalType::BLOB}, LogicalType::GEOMETRY(), SiloDecodeFunction));
+	// Can throw on invalid input (bad blob, coordinate overflow, unsupported geometry type)
+	decode_set.SetFallible();
 	CreateScalarFunctionInfo decode_info(std::move(decode_set));
 	decode_info.descriptions.push_back({
 	    {geosilo_type},
@@ -1610,6 +1624,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunctionSet metadata_set("geosilo_metadata");
 	metadata_set.AddFunction(ScalarFunction("geosilo_metadata", {geosilo_type}, meta_type, SiloMetadataFunction));
 	metadata_set.AddFunction(ScalarFunction("geosilo_metadata", {LogicalType::BLOB}, meta_type, SiloMetadataFunction));
+	// Can throw on invalid input (bad blob, coordinate overflow, unsupported geometry type)
+	metadata_set.SetFallible();
 	CreateScalarFunctionInfo metadata_info(std::move(metadata_set));
 	const char *metadata_desc =
 	    "Reads the GEOSILO header without decoding the geometry. "
@@ -1634,6 +1650,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// --- ST_* function overloads (direct on GEOSILO, no decode) ---
 	auto register_st = [&](const char *name, ScalarFunction fn, const char *param_name,
 	                       const char *desc, vector<string> examples, vector<string> categories) {
+		// All GEOSILO ST_* overloads throw on an invalid blob
+		fn.SetFallible();
 		CreateScalarFunctionInfo info(std::move(fn));
 		// Add the GEOSILO overload without replacing Spatial's existing overloads.
 		// The CreateScalarFunctionInfo overload does not set this policy for us.
