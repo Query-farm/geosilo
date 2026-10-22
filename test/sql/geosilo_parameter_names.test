@@ -1,0 +1,41 @@
+# name: test/sql/geosilo_parameter_names.test
+# description: duckdb_functions() reports the declared parameter names instead of col<N>
+# group: [geosilo]
+
+require geosilo
+
+query II
+SELECT DISTINCT function_name, parameters FROM duckdb_functions()
+WHERE function_name IN ('ST_Area', 'ST_GeometryType', 'ST_IsEmpty', 'ST_Length', 'ST_NPoints', 'ST_Perimeter', 'ST_X', 'ST_XMax', 'ST_XMin', 'ST_Y', 'ST_YMax', 'ST_YMin', 'geosilo_decode', 'geosilo_encode', 'geosilo_metadata')
+ORDER BY ALL;
+----
+ST_Area	[geom]
+ST_GeometryType	[geom]
+ST_IsEmpty	[geom]
+ST_Length	[geom]
+ST_NPoints	[geom]
+ST_Perimeter	[geom]
+ST_X	[geom]
+ST_XMax	[geom]
+ST_XMin	[geom]
+ST_Y	[geom]
+ST_YMax	[geom]
+ST_YMin	[geom]
+geosilo_decode	[blob]
+geosilo_decode	[geom]
+geosilo_encode	[geometry]
+geosilo_encode	[geometry, scale]
+geosilo_metadata	[blob]
+geosilo_metadata	[geom]
+
+# The parameters are still positional: calls work as before
+
+query I
+SELECT ST_AsText(geosilo_decode(geosilo_encode('POINT (-75 40)'::GEOMETRY)));
+----
+POINT (-75 40)
+
+query III
+SELECT m.geometry_type, m.vertex_type, m.scale FROM (SELECT geosilo_metadata(geosilo_encode('POINT (1 2)'::GEOMETRY, 100)) AS m);
+----
+POINT	XY	100
