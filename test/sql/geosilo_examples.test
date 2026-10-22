@@ -1,0 +1,194 @@
+# name: test/sql/geosilo_examples.test
+# description: every example in the geosilo function descriptions runs, and BLOB casts to GEOSILO
+# group: [geosilo]
+
+require geosilo
+
+statement ok
+INSTALL spatial;
+
+statement ok
+LOAD spatial;
+
+# The examples registered in the function descriptions. If an example changes, update the list below and the
+# statement that runs it.
+query II
+SELECT function_name, example
+FROM (SELECT DISTINCT function_name, unnest(examples) AS example
+      FROM duckdb_functions()
+      WHERE function_name LIKE 'geosilo%' OR list_contains(parameter_types, 'GEOSILO'))
+ORDER BY ALL;
+----
+ST_Area	ST_Area(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))'))::GEOSILO)
+ST_GeometryType	ST_GeometryType(geosilo_encode(ST_Point(1, 2))::GEOSILO)
+ST_IsEmpty	ST_IsEmpty(geosilo_encode(ST_GeomFromText('POINT EMPTY'))::GEOSILO)
+ST_Length	ST_Length(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 3 4)'))::GEOSILO)
+ST_NPoints	ST_NPoints(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'))::GEOSILO)
+ST_Perimeter	ST_Perimeter(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))'))::GEOSILO)
+ST_X	ST_X(geosilo_encode(ST_Point(1.5, 2.5))::GEOSILO)
+ST_XMax	ST_XMax(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO)
+ST_XMin	ST_XMin(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO)
+ST_Y	ST_Y(geosilo_encode(ST_Point(1.5, 2.5))::GEOSILO)
+ST_YMax	ST_YMax(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO)
+ST_YMin	ST_YMin(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO)
+geosilo_decode	SELECT geosilo_decode(blob_col) FROM (SELECT geosilo_encode(ST_Point(1, 2)) AS blob_col) t
+geosilo_decode	SELECT geosilo_decode(silo_col) FROM (SELECT ST_Point(1, 2)::GEOSILO AS silo_col) t
+geosilo_decode	geosilo_decode(geosilo_encode(ST_Point(1, 2))::GEOSILO)
+geosilo_encode	geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'))
+geosilo_encode	geosilo_encode(ST_GeomFromText('LINESTRING(500000.25 4649776.75, 500010.5 4649780)'), 100)
+geosilo_encode	geosilo_encode(ST_Point(1, 2))
+geosilo_encode	geosilo_encode(ST_Point(1.234, 5.678), 1000000)
+geosilo_metadata	geosilo_metadata(geosilo_encode(ST_Point(1, 2)))
+geosilo_metadata	geosilo_metadata(geosilo_encode(ST_Point(1, 2))::GEOSILO)
+
+# --- Run each example verbatim ---
+
+query I
+SELECT ST_Area(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))'))::GEOSILO);
+----
+11.999999999999998
+
+query I
+SELECT ST_GeometryType(geosilo_encode(ST_Point(1, 2))::GEOSILO);
+----
+POINT
+
+query I
+SELECT ST_IsEmpty(geosilo_encode(ST_GeomFromText('POINT EMPTY'))::GEOSILO);
+----
+true
+
+query I
+SELECT ST_Length(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 3 4)'))::GEOSILO);
+----
+5.0
+
+query I
+SELECT ST_NPoints(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'))::GEOSILO);
+----
+3
+
+query I
+SELECT ST_Perimeter(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))'))::GEOSILO);
+----
+14.0
+
+query I
+SELECT ST_X(geosilo_encode(ST_Point(1.5, 2.5))::GEOSILO);
+----
+1.5
+
+query I
+SELECT ST_XMax(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO);
+----
+5.0
+
+query I
+SELECT ST_XMin(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO);
+----
+0.0
+
+query I
+SELECT ST_Y(geosilo_encode(ST_Point(1.5, 2.5))::GEOSILO);
+----
+2.5
+
+query I
+SELECT ST_YMax(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO);
+----
+5.0
+
+query I
+SELECT ST_YMin(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO);
+----
+0.0
+
+query I
+SELECT geosilo_decode(blob_col) FROM (SELECT geosilo_encode(ST_Point(1, 2)) AS blob_col) t
+----
+POINT (1 2)
+
+query I
+SELECT geosilo_decode(silo_col) FROM (SELECT ST_Point(1, 2)::GEOSILO AS silo_col) t
+----
+POINT (1 2)
+
+query I
+SELECT geosilo_decode(geosilo_encode(ST_Point(1, 2))::GEOSILO);
+----
+POINT (1 2)
+
+statement ok
+SELECT geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'));
+
+statement ok
+SELECT geosilo_encode(ST_GeomFromText('LINESTRING(500000.25 4649776.75, 500010.5 4649780)'), 100);
+
+statement ok
+SELECT geosilo_encode(ST_Point(1, 2));
+
+statement ok
+SELECT geosilo_encode(ST_Point(1.234, 5.678), 1000000);
+
+query I
+SELECT geosilo_metadata(geosilo_encode(ST_Point(1, 2)));
+----
+{'geometry_type': POINT, 'vertex_type': XY, 'scale': 10000000}
+
+query I
+SELECT geosilo_metadata(geosilo_encode(ST_Point(1, 2))::GEOSILO);
+----
+{'geometry_type': POINT, 'vertex_type': XY, 'scale': 10000000}
+
+# --- BLOB -> GEOSILO cast ---
+
+# Full-header blobs (caller-supplied scale) cast and keep their scale
+query II
+SELECT ST_AsText(geosilo_encode(ST_GeomFromText('LINESTRING(500000.25 4649776.75, 500010.5 4649780)'), 100)::GEOSILO),
+       geosilo_metadata(geosilo_encode(ST_Point(1.234, 5.678), 1000000)::GEOSILO).scale;
+----
+LINESTRING (500000.25 4649776.75, 500010.5 4649780)	1000000
+
+# The cast is a validated copy of the bytes: decoding through GEOSILO or the raw BLOB gives the same geometry
+query I
+SELECT ST_AsText(geosilo_decode(b::GEOSILO)) = ST_AsText(geosilo_decode(b))
+FROM (SELECT geosilo_encode(ST_GeomFromText('POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))')) AS b) t;
+----
+true
+
+query I
+SELECT NULL::BLOB::GEOSILO IS NULL;
+----
+true
+
+statement error
+SELECT '\x00\x01'::BLOB::GEOSILO;
+----
+GeoSilo: invalid magic byte 0x00
+
+statement error
+SELECT ''::BLOB::GEOSILO;
+----
+GeoSilo: blob is empty
+
+statement error
+SELECT '\x47\x01'::BLOB::GEOSILO;
+----
+GeoSilo: blob too small
+
+statement error
+SELECT '\x47\x01\x09\x00\x80\x96\x98\x00\x00\x00\x00\x00'::BLOB::GEOSILO;
+----
+GeoSilo: invalid geometry type 9
+
+query I
+SELECT TRY_CAST(b AS GEOSILO) IS NULL FROM (VALUES ('\x00\x01'::BLOB), (''::BLOB)) t(b);
+----
+true
+true
+
+# The cast is explicit only: a BLOB is not silently accepted where GEOSILO is expected
+statement error
+SELECT ST_Area(geosilo_encode(ST_Point(1, 2)));
+----
+No function matches
