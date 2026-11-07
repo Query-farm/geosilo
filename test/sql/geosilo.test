@@ -237,7 +237,7 @@ GEOMETRYCOLLECTION	XY	10000000
 statement error
 SELECT geosilo_metadata('\x00\x01\x02\x03'::BLOB);
 ----
-GeoSilo: invalid blob
+GeoSilo: invalid magic byte 0x00
 
 # ---------------------------------------------------------------------------
 # More empty geometry types

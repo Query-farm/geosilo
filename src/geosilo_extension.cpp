@@ -63,8 +63,12 @@ namespace duckdb {
 //   v2 (0x02): MULTIPOINT uses delta encoding between sub-points.
 //   v3 (0x03): Polygon rings omit the closing vertex (reconstructed on decode).
 //   The reader accepts v1, v2, and v3. Feature checks:
-//     MULTIPOINT delta: version >= 2
+//     MULTIPOINT delta: version >= 2, or nested in a GEOMETRYCOLLECTION (always written delta-encoded)
 //     Ring closure elimination: version >= 3
+//   GEOMETRYCOLLECTIONs are written with a v2 header.
+//
+// Readers bounds-check every access: truncated or corrupt blobs raise an error, element counts are checked
+// against the remaining bytes before use, and nesting is limited to Geometry::MAX_RECURSION_DEPTH.
 
 static constexpr uint8_t GEOSILO_MAGIC      = 0x47; // 'G' — full header
 static constexpr uint8_t GEOSILO_VERSION_1   = 0x01;
@@ -73,6 +77,9 @@ static constexpr uint8_t GEOSILO_VERSION_3   = 0x03; // + ring closure eliminati
 static constexpr int64_t DEFAULT_SCALE       = 10000000; // 1e7
 static constexpr int16_t DELTA_ESCAPE        = std::numeric_limits<int16_t>::min(); // -32768
 static constexpr int32_t EMPTY_COORD         = std::numeric_limits<int32_t>::max();
+
+// Single source for Version() and telemetry.
+static constexpr const char *GEOSILO_EXTENSION_VERSION = "2026110701";
 
 // ---------------------------------------------------------------------------
 // Compact magic bytes (0x50 – 0x67)
@@ -213,239 +220,499 @@ struct SiloEncodeBindData : public FunctionData {
 };
 
 // ---------------------------------------------------------------------------
-// Writer: GEOMETRY (WKB bytes) → GeoSilo v2 blob
+// Shared helpers
 // ---------------------------------------------------------------------------
-// Uses raw pointer writes to a pre-sized buffer. The worst-case silo output
-// size is bounded by the WKB input size (every coordinate shrinks or stays
-// the same), so we allocate WKB_size/2 + 14 upfront and never resize.
+
+// GEOSILO stores coordinates as int32 and deltas between consecutive coordinates. A delta can exceed the
+// int32 range (e.g. -179 -> 179 degrees at scale 1e7), so deltas are computed and applied with wrapping
+// (modulo 2^32) arithmetic. This keeps the round trip exact and avoids signed-overflow UB; for deltas that
+// fit in int32 the encoding is byte-for-byte identical to the original format.
+static inline int32_t WrapSub(int32_t a, int32_t b) {
+	uint32_t r = static_cast<uint32_t>(a) - static_cast<uint32_t>(b);
+	int32_t out;
+	memcpy(&out, &r, sizeof(out));
+	return out;
+}
+
+static inline int32_t WrapAdd(int32_t a, int32_t b) {
+	uint32_t r = static_cast<uint32_t>(a) + static_cast<uint32_t>(b);
+	int32_t out;
+	memcpy(&out, &r, sizeof(out));
+	return out;
+}
+
+// DuckDB's GEOMETRY readers refuse nesting deeper than this, so GEOSILO enforces the same bound on both
+// encode and decode. It also caps recursion when walking untrusted blobs.
+static constexpr idx_t GEOSILO_MAX_DEPTH = Geometry::MAX_RECURSION_DEPTH;
+
+// Multi-geometry parts sit one level below their parent in WKB, so they count against the limit too.
+static inline bool ExceedsDepth(GeometryType type, idx_t depth) {
+	bool has_part_level = type == GeometryType::MULTIPOINT || type == GeometryType::MULTILINESTRING ||
+	                      type == GeometryType::MULTIPOLYGON;
+	return depth >= GEOSILO_MAX_DEPTH || (has_part_level && depth + 1 >= GEOSILO_MAX_DEPTH);
+}
+
+// MULTIPOINTs are delta-encoded from v2 on. Nested inside a GEOMETRYCOLLECTION they have always been written
+// delta-encoded, even though collections carried a v1 header until 2026110701, so nested MULTIPOINTs are
+// always read as delta-encoded (this also fixes decoding of collections written by earlier releases).
+static inline bool MultiPointIsDelta(uint8_t version, idx_t depth) {
+	return version >= GEOSILO_VERSION_2 || depth > 0;
+}
+
+static inline uint32_t VertexWidth(VertexType vert_type) {
+	return 2 + ((vert_type == VertexType::XYZ || vert_type == VertexType::XYZM) ? 1 : 0) +
+	       ((vert_type == VertexType::XYM || vert_type == VertexType::XYZM) ? 1 : 0);
+}
+
+static inline bool IsValidGeometryType(uint32_t type) {
+	return type >= static_cast<uint32_t>(GeometryType::POINT) &&
+	       type <= static_cast<uint32_t>(GeometryType::GEOMETRYCOLLECTION);
+}
+
+// ISO WKB type code (DuckDB's internal GEOMETRY representation): type + 1000 (Z) + 2000 (M).
+static inline uint32_t IsoWkbType(GeometryType type, uint32_t vw, bool has_m) {
+	bool has_z = (vw == 4) || (vw == 3 && !has_m);
+	return static_cast<uint32_t>(type) + (has_z ? 1000 : 0) + (has_m ? 2000 : 0);
+}
+
+// Growable output buffer used by both the encoder and the decoder.
+class ByteBuffer {
+public:
+	void Reset(idx_t reserve) {
+		if (buf_.size() < reserve) {
+			buf_.resize(reserve);
+		}
+		pos_ = 0;
+	}
+	void Ensure(idx_t n) {
+		if (pos_ + n > buf_.size()) {
+			buf_.resize(MaxValue<idx_t>(buf_.size() * 2, pos_ + n));
+		}
+	}
+	void Byte(uint8_t b) {
+		Ensure(1);
+		buf_[pos_++] = b;
+	}
+	template <class T>
+	void Put(T v) {
+		Ensure(sizeof(T));
+		memcpy(buf_.data() + pos_, &v, sizeof(T));
+		pos_ += sizeof(T);
+	}
+	// Unchecked variant, only after Ensure() reserved the space.
+	template <class T>
+	void PutUnchecked(T v) {
+		memcpy(buf_.data() + pos_, &v, sizeof(T));
+		pos_ += sizeof(T);
+	}
+	const char *Data() const {
+		return reinterpret_cast<const char *>(buf_.data());
+	}
+	idx_t Size() const {
+		return pos_;
+	}
+
+private:
+	vector<uint8_t> buf_;
+	idx_t pos_ = 0;
+};
+
+// Bounds-checked little-endian reader over an untrusted byte range.
+class ByteCursor {
+public:
+	ByteCursor(const uint8_t *data, idx_t size, const char *what) : ptr_(data), end_(data + size), what_(what) {
+	}
+	idx_t Remaining() const {
+		return static_cast<idx_t>(end_ - ptr_);
+	}
+	void Need(idx_t n) const {
+		if (Remaining() < n) {
+			throw InvalidInputException("%s: input is truncated or malformed", what_);
+		}
+	}
+	uint8_t U8() {
+		Need(1);
+		return *ptr_++;
+	}
+	template <class T>
+	T Get() {
+		Need(sizeof(T));
+		T v;
+		memcpy(&v, ptr_, sizeof(T));
+		ptr_ += sizeof(T);
+		return v;
+	}
+	void Skip(idx_t n) {
+		Need(n);
+		ptr_ += n;
+	}
+	// Reads an element count and rejects counts that cannot possibly fit in the remaining bytes, so a
+	// corrupt count can never drive a huge allocation or a long loop.
+	uint32_t Count(idx_t min_bytes_per_element) {
+		auto n = Get<uint32_t>();
+		if (min_bytes_per_element > 0 && static_cast<idx_t>(n) > Remaining() / min_bytes_per_element) {
+			throw InvalidInputException("%s: element count %u exceeds the remaining %llu bytes", what_, n,
+			                            static_cast<unsigned long long>(Remaining()));
+		}
+		return n;
+	}
+
+private:
+	const uint8_t *ptr_;
+	const uint8_t *end_;
+	const char *what_;
+};
+
+// ---------------------------------------------------------------------------
+// Header parsing (shared by every reader of GEOSILO bytes)
+// ---------------------------------------------------------------------------
+
+struct SiloHeader {
+	GeometryType geom_type = GeometryType::INVALID;
+	VertexType vert_type = VertexType::XY;
+	int64_t scale = DEFAULT_SCALE;
+	double dbl_scale = static_cast<double>(DEFAULT_SCALE); // coordinates are stored as round(value * scale)
+	uint8_t version = GEOSILO_VERSION_3;
+	idx_t body_offset = 0;
+	bool compact = false;
+};
+
+// Decode a compact magic byte into geometry type, vertex type, and scale.
+static void ResolveCompactMagic(uint8_t magic, SiloHeader &header) {
+	static constexpr GeometryType type_table[] = {GeometryType::POINT,      GeometryType::LINESTRING,
+	                                              GeometryType::POLYGON,    GeometryType::MULTIPOINT,
+	                                              GeometryType::MULTILINESTRING, GeometryType::MULTIPOLYGON};
+	uint8_t offset = magic - COMPACT_MAGIC_BASE;
+	uint8_t variant = offset % 4; // 0=XY/1e7, 1=XYZ/1e7, 2=XY/100, 3=XYZ/100
+	header.geom_type = type_table[offset / 4];
+	header.vert_type = (variant & 1) ? VertexType::XYZ : VertexType::XY;
+	header.scale = (variant >= 2) ? 100 : 10000000;
+	header.dbl_scale = static_cast<double>(header.scale);
+	header.version = GEOSILO_VERSION_3;
+	header.body_offset = 1;
+	header.compact = true;
+}
+
+// Parses and validates the GEOSILO header. Returns an empty string on success, otherwise the error.
+static string TryParseSiloHeader(const uint8_t *data, idx_t size, SiloHeader &header) {
+	if (size < 1) {
+		return "GeoSilo: blob is empty";
+	}
+	uint8_t magic = data[0];
+	if (magic >= COMPACT_MAGIC_BASE && magic <= COMPACT_MAGIC_MAX) {
+		ResolveCompactMagic(magic, header);
+		return string();
+	}
+	if (magic != GEOSILO_MAGIC) {
+		return StringUtil::Format("GeoSilo: invalid magic byte 0x%02x", magic);
+	}
+	if (size < 12) {
+		return "GeoSilo: blob too small for a GEOSILO header";
+	}
+	uint8_t version = data[1];
+	if (version < GEOSILO_VERSION_1 || version > GEOSILO_VERSION_3) {
+		return StringUtil::Format("GeoSilo: unsupported version %d", static_cast<int>(version));
+	}
+	uint8_t geom_type = data[2];
+	if (!IsValidGeometryType(geom_type)) {
+		return StringUtil::Format("GeoSilo: invalid geometry type %d", static_cast<int>(geom_type));
+	}
+	uint8_t vert_type = data[3];
+	if (vert_type > static_cast<uint8_t>(VertexType::XYZM)) {
+		return StringUtil::Format("GeoSilo: invalid vertex type %d", static_cast<int>(vert_type));
+	}
+	int64_t scale;
+	memcpy(&scale, data + 4, 8);
+	if (scale <= 0) {
+		return "GeoSilo: invalid scale in header";
+	}
+	header.version = version;
+	header.geom_type = static_cast<GeometryType>(geom_type);
+	header.vert_type = static_cast<VertexType>(vert_type);
+	header.scale = scale;
+	header.dbl_scale = static_cast<double>(scale);
+	header.body_offset = 12;
+	header.compact = false;
+	return string();
+}
+
+static SiloHeader ParseSiloHeader(const uint8_t *data, idx_t size) {
+	SiloHeader header;
+	auto error = TryParseSiloHeader(data, size, header);
+	if (!error.empty()) {
+		throw InvalidInputException(error);
+	}
+	return header;
+}
+
+// ---------------------------------------------------------------------------
+// Writer: GEOMETRY (DuckDB's internal ISO WKB) → GeoSilo blob
+// ---------------------------------------------------------------------------
 
 class SiloWriter {
 public:
-	explicit SiloWriter(int64_t scale) : scale_(scale), dbl_scale_(static_cast<double>(scale)) {}
+	explicit SiloWriter(int64_t scale) {
+		SetScale(scale);
+	}
 
-	void SetScale(int64_t scale) { scale_ = scale; dbl_scale_ = static_cast<double>(scale); }
+	void SetScale(int64_t scale) {
+		if (scale <= 0) {
+			throw InvalidInputException("geosilo_encode: scale must be a positive integer, got %lld",
+			                            static_cast<long long>(scale));
+		}
+		scale_ = scale;
+		dbl_scale_ = static_cast<double>(scale);
+	}
 
 	string_t Encode(const uint8_t *data, idx_t size, Vector &result) {
-		rp_ = data;
+		ByteCursor in(data, size, "geosilo_encode");
+		in_ = &in;
 
-		auto byte_order = RByte();
-		(void)byte_order;
-		auto wkb_type = RU32();
-		auto geom_type = static_cast<GeometryType>(wkb_type & 0xFF);
-		auto has_z = (wkb_type & 0x80000000) != 0;
-		auto has_m = (wkb_type & 0x40000000) != 0;
+		uint32_t vw;
+		bool has_m;
+		auto geom_type = ReadWkbHeader(vw, has_m);
+		vw_ = vw;
 		VertexType vert_type = VertexType::XY;
-		if (has_z && has_m)      vert_type = VertexType::XYZM;
-		else if (has_z)          vert_type = VertexType::XYZ;
-		else if (has_m)          vert_type = VertexType::XYM;
-		vw_ = 2 + (has_z ? 1 : 0) + (has_m ? 1 : 0);
+		if (vw == 4) {
+			vert_type = VertexType::XYZM;
+		} else if (vw == 3) {
+			vert_type = has_m ? VertexType::XYM : VertexType::XYZ;
+		}
 
-		// Pre-size buffer. Silo is always <= WKB: worst case is all escape
-		// deltas (6 bytes vs 8 bytes per coord = 75%) plus 14-byte header.
-		buf_.resize(size + 14);
-		wp_ = buf_.data();
+		out_.Reset(size + 16);
 
 		// Try compact encoding: single magic byte replaces the 12-byte full header.
 		uint8_t compact_magic = TryCompactMagic(geom_type, vert_type);
 		if (compact_magic) {
-			WByte(compact_magic);
+			out_.Byte(compact_magic);
 			ring_closure_ = (geom_type == GeometryType::POLYGON || geom_type == GeometryType::MULTIPOLYGON);
 		} else {
 			// Full header — version selects encoding features
 			uint8_t version = GEOSILO_VERSION_1;
-			if (geom_type == GeometryType::MULTIPOINT) version = GEOSILO_VERSION_2;
-			if (geom_type == GeometryType::POLYGON || geom_type == GeometryType::MULTIPOLYGON) version = GEOSILO_VERSION_3;
+			// v2 marks delta-encoded MULTIPOINTs, including those nested in a GEOMETRYCOLLECTION.
+			if (geom_type == GeometryType::MULTIPOINT || geom_type == GeometryType::GEOMETRYCOLLECTION) {
+				version = GEOSILO_VERSION_2;
+			}
+			if (geom_type == GeometryType::POLYGON || geom_type == GeometryType::MULTIPOLYGON) {
+				version = GEOSILO_VERSION_3;
+			}
 			ring_closure_ = (version >= GEOSILO_VERSION_3);
-			WByte(GEOSILO_MAGIC);
-			WByte(version);
-			WByte(static_cast<uint8_t>(geom_type));
-			WByte(static_cast<uint8_t>(vert_type));
-			WI64(scale_);
+			out_.Byte(GEOSILO_MAGIC);
+			out_.Byte(version);
+			out_.Byte(static_cast<uint8_t>(geom_type));
+			out_.Byte(static_cast<uint8_t>(vert_type));
+			out_.Put<int64_t>(scale_);
 		}
 
-		EncodeGeometry(geom_type);
-
-		auto actual_size = static_cast<idx_t>(wp_ - buf_.data());
-		return StringVector::AddStringOrBlob(result, reinterpret_cast<const char *>(buf_.data()), actual_size);
+		EncodeGeometry(geom_type, 0);
+		in_ = nullptr;
+		return StringVector::AddStringOrBlob(result, out_.Data(), out_.Size());
 	}
 
 private:
-	// --- WKB reading (unchecked in inner loop — validated by overall size) ---
-	uint8_t RByte()  { return *rp_++; }
-	uint32_t RU32()  { uint32_t v; memcpy(&v, rp_, 4); rp_ += 4; return v; }
-	double RDbl()    { double v; memcpy(&v, rp_, 8); rp_ += 8; return v; }
+	// Reads a WKB geometry header (byte order + type). Accepts ISO (1000/2000/3000) and EWKB flag encodings.
+	GeometryType ReadWkbHeader(uint32_t &vw, bool &has_m) {
+		auto byte_order = in_->U8();
+		if (byte_order != 1) {
+			throw InvalidInputException("geosilo_encode: only little-endian WKB is supported");
+		}
+		auto meta = in_->Get<uint32_t>();
+		auto type_id = (meta & 0x0000FFFF) % 1000;
+		auto flag_id = (meta & 0x0000FFFF) / 1000;
+		bool has_z = (flag_id & 0x01) || (meta & 0x80000000);
+		has_m = (flag_id & 0x02) || (meta & 0x40000000);
+		if (!IsValidGeometryType(type_id) || flag_id > 3) {
+			throw InvalidInputException("GeoSilo: unsupported geometry type %d", static_cast<int>(meta & 0xFFFF));
+		}
+		vw = 2 + (has_z ? 1 : 0) + (has_m ? 1 : 0);
+		return static_cast<GeometryType>(type_id);
+	}
 
-	// --- Output writing (raw pointer, no resize) ---
-	void WByte(uint8_t b)    { *wp_++ = b; }
-	void WU32(uint32_t v)    { memcpy(wp_, &v, 4); wp_ += 4; }
-	void WI16(int16_t v)     { memcpy(wp_, &v, 2); wp_ += 2; }
-	void WI32(int32_t v)     { memcpy(wp_, &v, 4); wp_ += 4; }
-	void WI64(int64_t v)     { memcpy(wp_, &v, 8); wp_ += 8; }
+	void SkipChildHeader() {
+		uint32_t child_vw;
+		bool child_m;
+		ReadWkbHeader(child_vw, child_m);
+	}
 
 	// Returns a compact magic byte for well-known type/vertex/scale combos, else 0.
 	uint8_t TryCompactMagic(GeometryType type, VertexType vert_type) {
-		if (vert_type == VertexType::XYM || vert_type == VertexType::XYZM) return 0;
-		if (type == GeometryType::GEOMETRYCOLLECTION) return 0;
-
+		if (vert_type == VertexType::XYM || vert_type == VertexType::XYZM) {
+			return 0;
+		}
 		uint8_t type_base;
 		switch (type) {
-		case GeometryType::POINT:            type_base = COMPACT_POINT_BASE; break;
-		case GeometryType::LINESTRING:       type_base = COMPACT_LINESTRING_BASE; break;
-		case GeometryType::POLYGON:          type_base = COMPACT_POLYGON_BASE; break;
-		case GeometryType::MULTIPOINT:       type_base = COMPACT_MULTIPOINT_BASE; break;
-		case GeometryType::MULTILINESTRING:  type_base = COMPACT_MULTILINESTRING_BASE; break;
-		case GeometryType::MULTIPOLYGON:     type_base = COMPACT_MULTIPOLYGON_BASE; break;
-		default: return 0;
+		case GeometryType::POINT:
+			type_base = COMPACT_POINT_BASE;
+			break;
+		case GeometryType::LINESTRING:
+			type_base = COMPACT_LINESTRING_BASE;
+			break;
+		case GeometryType::POLYGON:
+			type_base = COMPACT_POLYGON_BASE;
+			break;
+		case GeometryType::MULTIPOINT:
+			type_base = COMPACT_MULTIPOINT_BASE;
+			break;
+		case GeometryType::MULTILINESTRING:
+			type_base = COMPACT_MULTILINESTRING_BASE;
+			break;
+		case GeometryType::MULTIPOLYGON:
+			type_base = COMPACT_MULTIPOLYGON_BASE;
+			break;
+		default:
+			return 0;
 		}
-
 		uint8_t offset = (vert_type == VertexType::XYZ) ? 1 : 0;
-		if (scale_ == 10000000) return type_base + offset;
-		if (scale_ == 100) return type_base + 2 + offset;
+		if (scale_ == 10000000) {
+			return type_base + offset;
+		}
+		if (scale_ == 100) {
+			return type_base + 2 + offset;
+		}
 		return 0;
 	}
 
 	int32_t ScaleCoord(double val) {
-		if (std::isnan(val)) return EMPTY_COORD;
-		auto scaled = static_cast<int64_t>(std::round(val * dbl_scale_));
-		if (scaled > std::numeric_limits<int32_t>::max() || scaled < std::numeric_limits<int32_t>::min()) {
+		if (std::isnan(val)) {
+			return EMPTY_COORD;
+		}
+		double scaled = std::round(val * dbl_scale_);
+		// INT32_MAX is reserved as the empty-coordinate sentinel.
+		if (!(scaled >= static_cast<double>(std::numeric_limits<int32_t>::min()) &&
+		      scaled < static_cast<double>(std::numeric_limits<int32_t>::max()))) {
 			throw InvalidInputException(
-			    "GeoSilo: coordinate %.7f overflows int32 at scale %lld. Use a smaller scale.",
-			    val, static_cast<long long>(scale_));
+			    "GeoSilo: coordinate %.7f overflows int32 at scale %lld. Use a smaller scale.", val,
+			    static_cast<long long>(scale_));
 		}
 		return static_cast<int32_t>(scaled);
 	}
 
 	void WriteDelta(int32_t delta) {
 		if (delta > std::numeric_limits<int16_t>::max() || delta <= std::numeric_limits<int16_t>::min()) {
-			WI16(DELTA_ESCAPE);
-			WI32(delta);
+			out_.Put<int16_t>(DELTA_ESCAPE);
+			out_.Put<int32_t>(delta);
 		} else {
-			WI16(static_cast<int16_t>(delta));
+			out_.Put<int16_t>(static_cast<int16_t>(delta));
 		}
 	}
 
-	void EncodeCoordinateSequence(uint32_t num_points) {
-		WU32(num_points);
-		if (num_points == 0) return;
-
-		// First vertex: absolute
+	// Writes `count` vertices from the input: the first absolute, the rest as deltas.
+	void EncodeVertices(uint32_t count) {
+		if (count == 0) {
+			return;
+		}
 		int32_t prev[4] = {0, 0, 0, 0};
 		for (uint32_t d = 0; d < vw_; d++) {
-			prev[d] = ScaleCoord(RDbl());
-			WI32(prev[d]);
+			prev[d] = ScaleCoord(in_->Get<double>());
+			out_.Put<int32_t>(prev[d]);
 		}
-		// Remaining vertices: delta
-		for (uint32_t i = 1; i < num_points; i++) {
+		for (uint32_t i = 1; i < count; i++) {
 			for (uint32_t d = 0; d < vw_; d++) {
-				int32_t scaled = ScaleCoord(RDbl());
-				WriteDelta(scaled - prev[d]);
+				int32_t scaled = ScaleCoord(in_->Get<double>());
+				WriteDelta(WrapSub(scaled, prev[d]));
 				prev[d] = scaled;
 			}
 		}
+	}
+
+	void EncodeCoordinateSequence() {
+		auto num_points = in_->Count(8 * vw_);
+		out_.Put<uint32_t>(num_points);
+		EncodeVertices(num_points);
 	}
 
 	// Encode a polygon ring, omitting the closing vertex (which equals the first).
-	// WKB ring has num_points including closure; we store num_points - 1.
-	void EncodeRing(uint32_t num_points) {
-		if (num_points < 2) {
-			WU32(num_points);
-			// Consume remaining WKB coords
-			for (uint32_t i = 0; i < num_points; i++)
-				for (uint32_t d = 0; d < vw_; d++) RDbl();
+	// The WKB ring has num_points including closure; we store num_points - 1.
+	void EncodeRing() {
+		auto num_points = in_->Count(8 * vw_);
+		if (num_points <= 1) {
+			// Degenerate ring: store it as-is (a 1-point ring decodes as that point plus its closure).
+			out_.Put<uint32_t>(num_points);
+			EncodeVertices(num_points);
 			return;
 		}
-		WU32(num_points - 1); // stored count excludes closure
+		out_.Put<uint32_t>(num_points - 1);
+		EncodeVertices(num_points - 1);
+		in_->Skip(8 * vw_); // the closing vertex equals the first
+	}
 
-		// First vertex: absolute
-		int32_t prev[4] = {0, 0, 0, 0};
-		for (uint32_t d = 0; d < vw_; d++) {
-			prev[d] = ScaleCoord(RDbl());
-			WI32(prev[d]);
-		}
-		// Middle vertices: delta (up to num_points - 2, skipping closure)
-		for (uint32_t i = 1; i < num_points - 1; i++) {
-			for (uint32_t d = 0; d < vw_; d++) {
-				int32_t scaled = ScaleCoord(RDbl());
-				WriteDelta(scaled - prev[d]);
-				prev[d] = scaled;
+	void EncodePolygon() {
+		auto num_rings = in_->Count(4);
+		out_.Put<uint32_t>(num_rings);
+		for (uint32_t r = 0; r < num_rings; r++) {
+			if (ring_closure_) {
+				EncodeRing();
+			} else {
+				EncodeCoordinateSequence();
 			}
 		}
-		// Consume the closing vertex from WKB (discard — it equals the first)
-		for (uint32_t d = 0; d < vw_; d++) RDbl();
 	}
 
 	// Delta-encode MULTIPOINT: like a coordinate sequence but skipping WKB sub-headers.
 	void EncodeMultiPointDelta() {
-		uint32_t num_parts = RU32();
-		WU32(num_parts);
-		if (num_parts == 0) return;
-
+		auto num_parts = in_->Count(5 + 8 * vw_);
+		out_.Put<uint32_t>(num_parts);
 		int32_t prev[4] = {0, 0, 0, 0};
-		// First point: absolute
-		RByte(); RU32(); // skip WKB sub-header
-		for (uint32_t d = 0; d < vw_; d++) {
-			prev[d] = ScaleCoord(RDbl());
-			WI32(prev[d]);
-		}
-		// Remaining points: delta
-		for (uint32_t p = 1; p < num_parts; p++) {
-			RByte(); RU32(); // skip WKB sub-header
+		for (uint32_t p = 0; p < num_parts; p++) {
+			SkipChildHeader();
 			for (uint32_t d = 0; d < vw_; d++) {
-				int32_t scaled = ScaleCoord(RDbl());
-				WriteDelta(scaled - prev[d]);
+				int32_t scaled = ScaleCoord(in_->Get<double>());
+				if (p == 0) {
+					out_.Put<int32_t>(scaled);
+				} else {
+					WriteDelta(WrapSub(scaled, prev[d]));
+				}
 				prev[d] = scaled;
 			}
 		}
 	}
 
-	void EncodeGeometry(GeometryType type) {
+	void EncodeGeometry(GeometryType type, idx_t depth) {
+		if (depth >= GEOSILO_MAX_DEPTH) {
+			throw InvalidInputException("GeoSilo: geometry exceeds the maximum nesting depth of %llu",
+			                            static_cast<unsigned long long>(GEOSILO_MAX_DEPTH));
+		}
 		switch (type) {
-		case GeometryType::POINT: {
+		case GeometryType::POINT:
 			for (uint32_t d = 0; d < vw_; d++) {
-				WI32(ScaleCoord(RDbl()));
+				out_.Put<int32_t>(ScaleCoord(in_->Get<double>()));
 			}
 			break;
-		}
-		case GeometryType::LINESTRING: {
-			EncodeCoordinateSequence(RU32());
+		case GeometryType::LINESTRING:
+			EncodeCoordinateSequence();
 			break;
-		}
-		case GeometryType::POLYGON: {
-			uint32_t num_rings = RU32();
-			WU32(num_rings);
-			for (uint32_t r = 0; r < num_rings; r++) {
-				uint32_t npts = RU32();
-				if (ring_closure_) EncodeRing(npts);
-				else EncodeCoordinateSequence(npts);
-			}
+		case GeometryType::POLYGON:
+			EncodePolygon();
 			break;
-		}
-		case GeometryType::MULTIPOINT: {
+		case GeometryType::MULTIPOINT:
 			EncodeMultiPointDelta();
 			break;
-		}
 		case GeometryType::MULTILINESTRING:
 		case GeometryType::MULTIPOLYGON: {
-			uint32_t num_parts = RU32();
-			WU32(num_parts);
-			auto inner = (type == GeometryType::MULTILINESTRING) ? GeometryType::LINESTRING
-			                                                     : GeometryType::POLYGON;
+			auto num_parts = in_->Count(9);
+			out_.Put<uint32_t>(num_parts);
 			for (uint32_t p = 0; p < num_parts; p++) {
-				RByte();   // byte order
-				RU32();    // type (skip)
-				EncodeGeometry(inner);
+				SkipChildHeader();
+				if (type == GeometryType::MULTILINESTRING) {
+					EncodeCoordinateSequence();
+				} else {
+					EncodePolygon();
+				}
 			}
 			break;
 		}
 		case GeometryType::GEOMETRYCOLLECTION: {
-			uint32_t num_parts = RU32();
-			WU32(num_parts);
+			auto num_parts = in_->Count(9);
+			out_.Put<uint32_t>(num_parts);
 			for (uint32_t p = 0; p < num_parts; p++) {
-				RByte(); // byte order
-				auto wt = RU32();
-				auto child_type = static_cast<GeometryType>(wt & 0xFF);
-				WByte(static_cast<uint8_t>(child_type));
-				EncodeGeometry(child_type);
+				uint32_t child_vw;
+				bool child_m;
+				auto child_type = ReadWkbHeader(child_vw, child_m);
+				if (child_vw != vw_) {
+					throw InvalidInputException("GeoSilo: geometry has inconsistent Z/M dimensions");
+				}
+				out_.Byte(static_cast<uint8_t>(child_type));
+				EncodeGeometry(child_type, depth + 1);
 			}
 			break;
 		}
@@ -454,220 +721,189 @@ private:
 		}
 	}
 
-	int64_t scale_;
-	double dbl_scale_;
+	int64_t scale_ = DEFAULT_SCALE;
+	double dbl_scale_ = static_cast<double>(DEFAULT_SCALE);
 	bool ring_closure_ = false; // true = omit closing vertex in polygon rings
 	uint32_t vw_ = 2;
-	const uint8_t *rp_ = nullptr;
-	uint8_t *wp_ = nullptr;
-	vector<uint8_t> buf_;
+	ByteCursor *in_ = nullptr;
+	ByteBuffer out_;
 };
 
 // ---------------------------------------------------------------------------
-// Compact magic resolution
+// SiloWalker: walk an (untrusted) silo blob calling a visitor per XY vertex
 // ---------------------------------------------------------------------------
+// No WKB output. Used for bbox, area, length, point counts and validation. Every read is bounds-checked,
+// counts are validated against the remaining bytes and nesting depth is capped. The Visitor provides:
+//   void OnPartStart(SiloPart kind)          — start of a point / linestring / polygon ring
+//   void OnVertex(int32_t x, int32_t y)      — every vertex (implicit ring closures are visited too)
+//   void OnPartEnd()                         — end of the part
 
-// Decode a compact magic byte into geometry type, vertex type, and inverse scale.
-static void ResolveCompactMagic(uint8_t magic, GeometryType &geom_type, VertexType &vert_type, double &inv_scale) {
-	static constexpr GeometryType type_table[] = {
-		GeometryType::POINT, GeometryType::LINESTRING, GeometryType::POLYGON,
-		GeometryType::MULTIPOINT, GeometryType::MULTILINESTRING, GeometryType::MULTIPOLYGON
-	};
-	uint8_t offset = magic - COMPACT_MAGIC_BASE;
-	uint8_t type_idx = offset / 4;
-	uint8_t variant = offset % 4; // 0=XY/1e7, 1=XYZ/1e7, 2=XY/100, 3=XYZ/100
-
-	geom_type = type_table[type_idx];
-	vert_type = (variant & 1) ? VertexType::XYZ : VertexType::XY;
-	inv_scale = (variant >= 2) ? (1.0 / 100.0) : (1.0 / 10000000.0);
-}
-
-// Map compact magic → scale (for metadata)
-static int64_t CompactMagicScale(uint8_t magic) {
-	return ((magic - COMPACT_MAGIC_BASE) % 4 >= 2) ? 100 : 10000000;
-}
-
-// ---------------------------------------------------------------------------
-// SiloWalker: walk silo binary calling a visitor per coordinate
-// ---------------------------------------------------------------------------
-// No WKB output. Used for bbox, area, length, etc. The Visitor must provide:
-//   void OnVertex(int32_t x, int32_t y)       — called for every vertex
-//   void OnRingStart()                         — called at start of each ring/sequence
-//   void OnRingEnd(bool is_closure_implicit)   — called at end of each ring/sequence
+enum class SiloPart : uint8_t { POINTS, LINE, EXTERIOR_RING, INTERIOR_RING };
 
 template <typename Visitor>
 class SiloWalker {
 public:
-	void Walk(const uint8_t *data, idx_t size, Visitor &visitor) {
-		rp_ = data;
-		if (size < 1) throw InvalidInputException("GeoSilo: blob too small");
-		uint8_t magic = RByte();
-
-		GeometryType geom_type;
-		VertexType vert_type;
-		double inv_scale;
-
-		if (magic >= COMPACT_MAGIC_BASE && magic <= COMPACT_MAGIC_MAX) {
-			ResolveCompactMagic(magic, geom_type, vert_type, inv_scale);
-			version_ = GEOSILO_VERSION_3;
-		} else if (magic == GEOSILO_MAGIC) {
-			if (size < 12) throw InvalidInputException("GeoSilo: blob too small");
-			version_ = RByte();
-			geom_type = static_cast<GeometryType>(RByte());
-			vert_type = static_cast<VertexType>(RByte());
-			auto scale = RI64();
-			inv_scale = 1.0 / static_cast<double>(scale);
-		} else {
-			throw InvalidInputException("GeoSilo: invalid magic byte 0x%02x", magic);
-		}
-
-		inv_scale_ = inv_scale;
-		vw_ = 2 + ((vert_type == VertexType::XYZ || vert_type == VertexType::XYZM) ? 1 : 0)
-		         + ((vert_type == VertexType::XYM || vert_type == VertexType::XYZM) ? 1 : 0);
-		ring_closure_ = (version_ >= GEOSILO_VERSION_3);
-
-		WalkGeometry(geom_type, visitor);
+	SiloWalker(const uint8_t *data, idx_t size, Visitor &visitor)
+	    : header_(ParseSiloHeader(data, size)),
+	      cur_(data + header_.body_offset, size - header_.body_offset, "GeoSilo"), visitor_(visitor) {
+		vw_ = VertexWidth(header_.vert_type);
+		ring_closure_ = header_.version >= GEOSILO_VERSION_3;
 	}
 
-	double inv_scale() const { return inv_scale_; }
+	void Walk() {
+		WalkGeometry(header_.geom_type, 0);
+	}
+
+	const SiloHeader &header() const {
+		return header_;
+	}
+	double dbl_scale() const {
+		return header_.dbl_scale;
+	}
+	idx_t Remaining() const {
+		return cur_.Remaining();
+	}
 
 private:
-	uint8_t RByte()  { return *rp_++; }
-	uint32_t RU32()  { uint32_t v; memcpy(&v, rp_, 4); rp_ += 4; return v; }
-	int16_t RI16()   { int16_t v; memcpy(&v, rp_, 2); rp_ += 2; return v; }
-	int32_t RI32()   { int32_t v; memcpy(&v, rp_, 4); rp_ += 4; return v; }
-	int64_t RI64()   { int64_t v; memcpy(&v, rp_, 8); rp_ += 8; return v; }
-	int32_t RDelta() {
-		int16_t d = RI16();
-		if (d == DELTA_ESCAPE) return RI32();
+	int32_t Delta() {
+		auto d = cur_.Get<int16_t>();
+		if (d == DELTA_ESCAPE) {
+			return cur_.Get<int32_t>();
+		}
 		return static_cast<int32_t>(d);
 	}
-	// Skip Z/M dimensions in delta
-	void SkipExtraDims() { for (uint32_t d = 2; d < vw_; d++) RDelta(); }
-	void SkipExtraDimsAbsolute() { for (uint32_t d = 2; d < vw_; d++) RI32(); }
 
-	void WalkCoordSeq(Visitor &visitor) {
-		uint32_t n = RU32();
-		if (n == 0) return;
-		visitor.OnRingStart();
-		int32_t prev_x = RI32(), prev_y = RI32();
-		SkipExtraDimsAbsolute();
-		visitor.OnVertex(prev_x, prev_y);
+	void WalkSequence(SiloPart kind, bool implicit_closure) {
+		auto n = cur_.Count(2 * vw_);
+		if (n == 0) {
+			return;
+		}
+		visitor_.OnPartStart(kind);
+		int32_t first_x = cur_.Get<int32_t>();
+		int32_t first_y = cur_.Get<int32_t>();
+		cur_.Skip(4 * (vw_ - 2));
+		int32_t x = first_x, y = first_y;
+		if (kind != SiloPart::POINTS || x != EMPTY_COORD) {
+			visitor_.OnVertex(x, y);
+		}
 		for (uint32_t i = 1; i < n; i++) {
-			prev_x += RDelta(); prev_y += RDelta();
-			SkipExtraDims();
-			visitor.OnVertex(prev_x, prev_y);
+			x = WrapAdd(x, Delta());
+			y = WrapAdd(y, Delta());
+			for (uint32_t d = 2; d < vw_; d++) {
+				Delta();
+			}
+			if (kind != SiloPart::POINTS || x != EMPTY_COORD) {
+				visitor_.OnVertex(x, y);
+			}
 		}
-		visitor.OnRingEnd(false);
+		if (implicit_closure) {
+			visitor_.OnVertex(first_x, first_y);
+		}
+		visitor_.OnPartEnd();
 	}
 
-	void WalkRing(Visitor &visitor) {
-		uint32_t stored = RU32();
-		if (stored == 0) return;
-		visitor.OnRingStart();
-		int32_t first_x = RI32(), first_y = RI32();
-		SkipExtraDimsAbsolute();
-		int32_t prev_x = first_x, prev_y = first_y;
-		visitor.OnVertex(prev_x, prev_y);
-		for (uint32_t i = 1; i < stored; i++) {
-			prev_x += RDelta(); prev_y += RDelta();
-			SkipExtraDims();
-			visitor.OnVertex(prev_x, prev_y);
+	void WalkPolygon() {
+		auto num_rings = cur_.Count(4);
+		for (uint32_t r = 0; r < num_rings; r++) {
+			WalkSequence(r == 0 ? SiloPart::EXTERIOR_RING : SiloPart::INTERIOR_RING, ring_closure_);
 		}
-		// Implicit closure
-		visitor.OnVertex(first_x, first_y);
-		visitor.OnRingEnd(true);
 	}
 
-	void WalkMultiPointDelta(Visitor &visitor) {
-		uint32_t n = RU32();
-		if (n == 0) return;
-		visitor.OnRingStart();
-		int32_t prev_x = RI32(), prev_y = RI32();
-		SkipExtraDimsAbsolute();
-		visitor.OnVertex(prev_x, prev_y);
-		for (uint32_t p = 1; p < n; p++) {
-			prev_x += RDelta(); prev_y += RDelta();
-			SkipExtraDims();
-			visitor.OnVertex(prev_x, prev_y);
+	void WalkPoint() {
+		int32_t x = cur_.Get<int32_t>();
+		int32_t y = cur_.Get<int32_t>();
+		cur_.Skip(4 * (vw_ - 2));
+		if (x != EMPTY_COORD) {
+			visitor_.OnPartStart(SiloPart::POINTS);
+			visitor_.OnVertex(x, y);
+			visitor_.OnPartEnd();
 		}
-		visitor.OnRingEnd(false);
 	}
 
-	void WalkGeometry(GeometryType type, Visitor &visitor) {
+	void WalkGeometry(GeometryType type, idx_t depth) {
+		if (ExceedsDepth(type, depth)) {
+			throw InvalidInputException("GeoSilo: geometry exceeds the maximum nesting depth of %llu",
+			                            static_cast<unsigned long long>(GEOSILO_MAX_DEPTH));
+		}
 		switch (type) {
-		case GeometryType::POINT: {
-			int32_t x = RI32(), y = RI32();
-			SkipExtraDimsAbsolute();
-			if (x != EMPTY_COORD) {
-				visitor.OnRingStart();
-				visitor.OnVertex(x, y);
-				visitor.OnRingEnd(false);
-			}
+		case GeometryType::POINT:
+			WalkPoint();
 			break;
-		}
 		case GeometryType::LINESTRING:
-			WalkCoordSeq(visitor);
+			WalkSequence(SiloPart::LINE, false);
 			break;
-		case GeometryType::POLYGON: {
-			uint32_t num_rings = RU32();
-			for (uint32_t r = 0; r < num_rings; r++) {
-				if (ring_closure_) WalkRing(visitor);
-				else WalkCoordSeq(visitor);
-			}
+		case GeometryType::POLYGON:
+			WalkPolygon();
 			break;
-		}
-		case GeometryType::MULTIPOINT: {
-			if (version_ >= GEOSILO_VERSION_2) {
-				WalkMultiPointDelta(visitor);
+		case GeometryType::MULTIPOINT:
+			if (MultiPointIsDelta(header_.version, depth)) {
+				WalkSequence(SiloPart::POINTS, false);
 			} else {
-				uint32_t n = RU32();
+				auto n = cur_.Count(4 * vw_);
 				for (uint32_t p = 0; p < n; p++) {
-					int32_t x = RI32(), y = RI32();
-					SkipExtraDimsAbsolute();
-					visitor.OnRingStart();
-					visitor.OnVertex(x, y);
-					visitor.OnRingEnd(false);
+					WalkPoint();
 				}
 			}
 			break;
-		}
 		case GeometryType::MULTILINESTRING: {
-			uint32_t n = RU32();
-			for (uint32_t p = 0; p < n; p++) WalkCoordSeq(visitor);
+			auto n = cur_.Count(4);
+			for (uint32_t p = 0; p < n; p++) {
+				WalkSequence(SiloPart::LINE, false);
+			}
 			break;
 		}
 		case GeometryType::MULTIPOLYGON: {
-			uint32_t n = RU32();
+			auto n = cur_.Count(4);
 			for (uint32_t p = 0; p < n; p++) {
-				uint32_t num_rings = RU32();
-				for (uint32_t r = 0; r < num_rings; r++) {
-					if (ring_closure_) WalkRing(visitor);
-					else WalkCoordSeq(visitor);
-				}
+				WalkPolygon();
 			}
 			break;
 		}
 		case GeometryType::GEOMETRYCOLLECTION: {
-			uint32_t n = RU32();
+			auto n = cur_.Count(5);
 			for (uint32_t p = 0; p < n; p++) {
-				auto child_type = static_cast<GeometryType>(RByte());
-				WalkGeometry(child_type, visitor);
+				auto child_type = cur_.U8();
+				if (!IsValidGeometryType(child_type)) {
+					throw InvalidInputException("GeoSilo: invalid geometry type %d in collection",
+					                            static_cast<int>(child_type));
+				}
+				WalkGeometry(static_cast<GeometryType>(child_type), depth + 1);
 			}
 			break;
 		}
-		default: break;
+		default:
+			throw InvalidInputException("GeoSilo: unsupported geometry type %d", static_cast<int>(type));
 		}
 	}
 
-	double inv_scale_ = 1.0 / static_cast<double>(DEFAULT_SCALE);
-	uint8_t version_ = GEOSILO_VERSION_1;
-	bool ring_closure_ = false;
+	SiloHeader header_;
+	ByteCursor cur_;
+	Visitor &visitor_;
 	uint32_t vw_ = 2;
-	const uint8_t *rp_ = nullptr;
+	bool ring_closure_ = false;
 };
 
 // --- Visitor implementations ---
+
+struct NullVisitor {
+	void OnPartStart(SiloPart) {
+	}
+	void OnVertex(int32_t, int32_t) {
+	}
+	void OnPartEnd() {
+	}
+};
+
+struct CountVisitor {
+	int64_t count = 0;
+	void OnPartStart(SiloPart) {
+	}
+	void OnVertex(int32_t, int32_t) {
+		count++;
+	}
+	void OnPartEnd() {
+	}
+};
 
 struct BBoxVisitor {
 	int32_t xmin = std::numeric_limits<int32_t>::max();
@@ -676,294 +912,287 @@ struct BBoxVisitor {
 	int32_t ymax = std::numeric_limits<int32_t>::min();
 	bool has_points = false;
 
+	void OnPartStart(SiloPart) {
+	}
 	void OnVertex(int32_t x, int32_t y) {
-		if (x < xmin) xmin = x;
-		if (x > xmax) xmax = x;
-		if (y < ymin) ymin = y;
-		if (y > ymax) ymax = y;
+		xmin = MinValue(xmin, x);
+		xmax = MaxValue(xmax, x);
+		ymin = MinValue(ymin, y);
+		ymax = MaxValue(ymax, y);
 		has_points = true;
 	}
-	void OnRingStart() {}
-	void OnRingEnd(bool) {}
+	void OnPartEnd() {
+	}
 };
 
+// Planar area of the polygonal parts: |exterior| - sum(|holes|) per polygon, summed over all polygons.
+// Points and linestrings contribute 0 (matching the spatial extension). The shoelace sum is computed on
+// coordinates relative to the ring's first vertex in double precision, so it cannot overflow.
 struct AreaVisitor {
-	// Shoelace formula: 2*A = sum of (x_i * y_{i+1} - x_{i+1} * y_i)
-	// Works on int32 coords with int64 accumulator.
-	int64_t twice_area = 0;
-	int32_t first_x = 0, first_y = 0;
-	int32_t prev_x = 0, prev_y = 0;
-	bool in_ring = false;
-	int ring_idx = 0; // 0 = exterior, >0 = hole
+	double total = 0.0; // in scaled units squared, times 2
+	double ring = 0.0;
+	int64_t origin_x = 0, origin_y = 0;
+	double prev_dx = 0.0, prev_dy = 0.0;
+	bool active = false;
+	bool first = false;
+	bool hole = false;
 
+	void OnPartStart(SiloPart kind) {
+		active = (kind == SiloPart::EXTERIOR_RING || kind == SiloPart::INTERIOR_RING);
+		hole = (kind == SiloPart::INTERIOR_RING);
+		ring = 0.0;
+		first = true;
+	}
 	void OnVertex(int32_t x, int32_t y) {
-		if (!in_ring) {
-			first_x = prev_x = x;
-			first_y = prev_y = y;
-			in_ring = true;
+		if (!active) {
 			return;
 		}
-		// Cross product contribution
-		twice_area += static_cast<int64_t>(prev_x) * y - static_cast<int64_t>(x) * prev_y;
-		prev_x = x; prev_y = y;
-	}
-	void OnRingStart() {
-		in_ring = false;
-	}
-	void OnRingEnd(bool) {
-		// Close ring: last vertex -> first vertex
-		if (in_ring) {
-			twice_area += static_cast<int64_t>(prev_x) * first_y - static_cast<int64_t>(first_x) * prev_y;
+		if (first) {
+			origin_x = x;
+			origin_y = y;
+			prev_dx = prev_dy = 0.0;
+			first = false;
+			return;
 		}
-		in_ring = false;
-		ring_idx++;
+		double dx = static_cast<double>(static_cast<int64_t>(x) - origin_x);
+		double dy = static_cast<double>(static_cast<int64_t>(y) - origin_y);
+		ring += prev_dx * dy - dx * prev_dy;
+		prev_dx = dx;
+		prev_dy = dy;
+	}
+	void OnPartEnd() {
+		if (!active) {
+			return;
+		}
+		// Closing edge back to the origin contributes prev x 0 - 0 x prev = 0.
+		total += hole ? -std::abs(ring) : std::abs(ring);
+		active = false;
 	}
 };
 
+// Sum of segment lengths over the parts selected by `Polygonal` (rings for perimeter, linestrings for length).
+template <bool POLYGONAL>
 struct LengthVisitor {
 	double total_length = 0.0;
 	int32_t prev_x = 0, prev_y = 0;
 	bool has_prev = false;
+	bool active = false;
 
+	void OnPartStart(SiloPart kind) {
+		bool ring = (kind == SiloPart::EXTERIOR_RING || kind == SiloPart::INTERIOR_RING);
+		active = POLYGONAL ? ring : (kind == SiloPart::LINE);
+		has_prev = false;
+	}
 	void OnVertex(int32_t x, int32_t y) {
+		if (!active) {
+			return;
+		}
 		if (has_prev) {
-			double dx = static_cast<double>(x - prev_x);
-			double dy = static_cast<double>(y - prev_y);
+			double dx = static_cast<double>(x) - static_cast<double>(prev_x);
+			double dy = static_cast<double>(y) - static_cast<double>(prev_y);
 			total_length += std::sqrt(dx * dx + dy * dy);
 		}
-		prev_x = x; prev_y = y;
+		prev_x = x;
+		prev_y = y;
 		has_prev = true;
 	}
-	void OnRingStart() { has_prev = false; }
-	void OnRingEnd(bool) { has_prev = false; }
+	void OnPartEnd() {
+		has_prev = false;
+		active = false;
+	}
 };
 
+// Fully validates a GEOSILO blob (header, structure, counts, nesting, no trailing bytes).
+// Returns an empty string when valid, otherwise the error message.
+static string ValidateSilo(const uint8_t *data, idx_t size) {
+	SiloHeader header;
+	auto error = TryParseSiloHeader(data, size, header);
+	if (!error.empty()) {
+		return error;
+	}
+	try {
+		NullVisitor vis;
+		SiloWalker<NullVisitor> walker(data, size, vis);
+		walker.Walk();
+		if (walker.Remaining() != 0) {
+			return StringUtil::Format("GeoSilo: %llu unexpected trailing bytes",
+			                          static_cast<unsigned long long>(walker.Remaining()));
+		}
+	} catch (std::exception &ex) {
+		ErrorData err(ex);
+		return err.RawMessage();
+	}
+	return string();
+}
+
 // ---------------------------------------------------------------------------
-// Reader: GeoSilo blob → WKB bytes
+// Reader: GeoSilo blob → GEOMETRY (DuckDB's internal ISO WKB)
 // ---------------------------------------------------------------------------
-// Uses raw pointer reads/writes. Output is allocated directly in StringVector
-// via EmptyString — no intermediate buffer, no copy. WKB output size is
-// bounded by silo_size * 4 (worst case: every 2-byte delta expands to 8-byte double).
 
 class SiloReader {
 public:
 	string_t Decode(const uint8_t *data, idx_t size, Vector &result) {
-		rp_ = data;
+		auto header = ParseSiloHeader(data, size);
+		ByteCursor in(data + header.body_offset, size - header.body_offset, "GeoSilo");
+		in_ = &in;
+		dbl_scale_ = header.dbl_scale;
+		version_ = header.version;
+		has_m_ = (header.vert_type == VertexType::XYM || header.vert_type == VertexType::XYZM);
+		vw_ = VertexWidth(header.vert_type);
 
-		if (size < 1) throw InvalidInputException("GeoSilo: blob too small");
-		uint8_t magic = RByte();
-
-		GeometryType geom_type;
-		VertexType vert_type;
-
-		if (magic >= COMPACT_MAGIC_BASE && magic <= COMPACT_MAGIC_MAX) {
-			// Compact format — magic byte encodes type, vertex, scale.
-			// Compact headers always imply latest features.
-			ResolveCompactMagic(magic, geom_type, vert_type, inv_scale_);
-			version_ = GEOSILO_VERSION_3;
-		} else if (magic == GEOSILO_MAGIC) {
-			// Full header
-			if (size < 12) throw InvalidInputException("GeoSilo: blob too small");
-			version_ = RByte();
-			if (version_ < GEOSILO_VERSION_1 || version_ > GEOSILO_VERSION_3) {
-				throw InvalidInputException("GeoSilo: unsupported version %d", version_);
-			}
-			geom_type = static_cast<GeometryType>(RByte());
-			vert_type = static_cast<VertexType>(RByte());
-			auto scale = RI64();
-			inv_scale_ = 1.0 / static_cast<double>(scale);
-		} else {
-			throw InvalidInputException("GeoSilo: invalid magic byte 0x%02x", magic);
-		}
-
-		bool has_z = (vert_type == VertexType::XYZ || vert_type == VertexType::XYZM);
-		bool has_m = (vert_type == VertexType::XYM || vert_type == VertexType::XYZM);
-		vw_ = 2 + (has_z ? 1 : 0) + (has_m ? 1 : 0);
-
-		// Pre-size buffer. Worst case: each 2-byte delta → 8-byte double (4x),
-		// plus 5-byte WKB part headers for Multi* types.
-		buf_.resize(size * 5 + 64);
-		wp_ = buf_.data();
-
-		// WKB header
-		WByte(0x01); // little-endian
-		uint32_t wkb_type = static_cast<uint32_t>(geom_type);
-		if (has_z) wkb_type |= 0x80000000;
-		if (has_m) wkb_type |= 0x40000000;
-		WU32(wkb_type);
-
-		DecodeGeometry(geom_type);
-
-		auto actual_size = static_cast<idx_t>(wp_ - buf_.data());
-		return StringVector::AddStringOrBlob(result, reinterpret_cast<const char *>(buf_.data()), actual_size);
+		out_.Reset(MinValue<idx_t>(size * 5 + 64, 1 << 20));
+		WriteWkbHeader(header.geom_type);
+		DecodeGeometry(header.geom_type, 0);
+		in_ = nullptr;
+		return StringVector::AddStringOrBlob(result, out_.Data(), out_.Size());
 	}
 
 private:
-	// --- Silo reading (raw pointer, no per-read bounds check) ---
-	uint8_t RByte()  { return *rp_++; }
-	uint32_t RU32()  { uint32_t v; memcpy(&v, rp_, 4); rp_ += 4; return v; }
-	int16_t RI16()   { int16_t v; memcpy(&v, rp_, 2); rp_ += 2; return v; }
-	int32_t RI32()   { int32_t v; memcpy(&v, rp_, 4); rp_ += 4; return v; }
-	int64_t RI64()   { int64_t v; memcpy(&v, rp_, 8); rp_ += 8; return v; }
-
-	int32_t RDelta() {
-		int16_t d = RI16();
-		if (d == DELTA_ESCAPE) return RI32();
+	int32_t Delta() {
+		auto d = in_->Get<int16_t>();
+		if (d == DELTA_ESCAPE) {
+			return in_->Get<int32_t>();
+		}
 		return static_cast<int32_t>(d);
 	}
 
-	// --- WKB writing (raw pointer, no resize) ---
-	void WByte(uint8_t b)    { *wp_++ = b; }
-	void WU32(uint32_t v)    { memcpy(wp_, &v, 4); wp_ += 4; }
-	void WDbl(double v)      { memcpy(wp_, &v, 8); wp_ += 8; }
-
-	double Unscale(int32_t val) {
-		if (val == EMPTY_COORD) return std::numeric_limits<double>::quiet_NaN();
-		return static_cast<double>(val) * inv_scale_;
+	double Unscale(int32_t val) const {
+		if (val == EMPTY_COORD) {
+			return std::numeric_limits<double>::quiet_NaN();
+		}
+		// Divide (rather than multiply by 1/scale) so values with <= log10(scale) decimals round-trip exactly.
+		return static_cast<double>(val) / dbl_scale_;
 	}
 
-	// Delta-decode MULTIPOINT: reverse of EncodeMultiPointDelta.
-	void DecodeMultiPointDelta() {
-		uint32_t num_parts = RU32();
-		WU32(num_parts);
-		if (num_parts == 0) return;
+	void WriteWkbHeader(GeometryType type) {
+		out_.Byte(0x01); // little-endian
+		out_.Put<uint32_t>(IsoWkbType(type, vw_, has_m_));
+	}
 
-		uint32_t wkb_type = static_cast<uint32_t>(GeometryType::POINT);
-		if (vw_ >= 3) wkb_type |= 0x80000000;
-		if (vw_ == 4) wkb_type |= 0x40000000;
-
-		int32_t prev[4] = {0, 0, 0, 0};
-		// First point: absolute
-		WByte(0x01);
-		WU32(wkb_type);
-		for (uint32_t d = 0; d < vw_; d++) {
-			prev[d] = RI32();
-			WDbl(Unscale(prev[d]));
+	// Decodes `count` vertices (first absolute, the rest deltas); optionally re-emits the first as closure.
+	void DecodeVertices(uint32_t count, bool emit_closure) {
+		if (count == 0) {
+			return;
 		}
-		// Remaining points: delta
-		for (uint32_t p = 1; p < num_parts; p++) {
-			WByte(0x01);
-			WU32(wkb_type);
+		out_.Ensure((static_cast<idx_t>(count) + 1) * 8 * vw_);
+		int32_t first[4] = {0, 0, 0, 0};
+		int32_t prev[4] = {0, 0, 0, 0};
+		for (uint32_t d = 0; d < vw_; d++) {
+			first[d] = prev[d] = in_->Get<int32_t>();
+			out_.PutUnchecked<double>(Unscale(prev[d]));
+		}
+		for (uint32_t i = 1; i < count; i++) {
 			for (uint32_t d = 0; d < vw_; d++) {
-				prev[d] += RDelta();
-				WDbl(Unscale(prev[d]));
+				prev[d] = WrapAdd(prev[d], Delta());
+				out_.PutUnchecked<double>(Unscale(prev[d]));
+			}
+		}
+		if (emit_closure) {
+			for (uint32_t d = 0; d < vw_; d++) {
+				out_.PutUnchecked<double>(Unscale(first[d]));
 			}
 		}
 	}
 
 	void DecodeCoordinateSequence() {
-		uint32_t num_points = RU32();
-		WU32(num_points);
-		if (num_points == 0) return;
-
-		// First vertex: absolute
-		int32_t prev[4] = {0, 0, 0, 0};
-		for (uint32_t d = 0; d < vw_; d++) {
-			prev[d] = RI32();
-			WDbl(Unscale(prev[d]));
-		}
-		// Remaining vertices: delta (no branch in inner loop)
-		for (uint32_t i = 1; i < num_points; i++) {
-			for (uint32_t d = 0; d < vw_; d++) {
-				prev[d] += RDelta();
-				WDbl(Unscale(prev[d]));
-			}
-		}
+		auto num_points = in_->Count(2 * vw_);
+		out_.Put<uint32_t>(num_points);
+		DecodeVertices(num_points, false);
 	}
 
-	// Decode a polygon ring where the closing vertex was omitted.
-	// Stored count = N-1; we emit N points (reconstruct closure from first vertex).
+	// Decode a polygon ring where the closing vertex was omitted: stored N-1, emit N (closure = first).
 	void DecodeRing() {
-		uint32_t stored_count = RU32();
-		WU32(stored_count + 1); // WKB ring includes closure
-		if (stored_count == 0) return;
+		auto stored_count = in_->Count(2 * vw_);
+		out_.Put<uint32_t>(stored_count == 0 ? 0 : stored_count + 1);
+		DecodeVertices(stored_count, true);
+	}
 
-		// First vertex: absolute (remember for closure)
-		int32_t first[4] = {0, 0, 0, 0};
-		int32_t prev[4] = {0, 0, 0, 0};
-		for (uint32_t d = 0; d < vw_; d++) {
-			first[d] = prev[d] = RI32();
-			WDbl(Unscale(prev[d]));
-		}
-		// Middle vertices: delta
-		for (uint32_t i = 1; i < stored_count; i++) {
-			for (uint32_t d = 0; d < vw_; d++) {
-				prev[d] += RDelta();
-				WDbl(Unscale(prev[d]));
+	void DecodePolygon() {
+		auto num_rings = in_->Count(4);
+		out_.Put<uint32_t>(num_rings);
+		for (uint32_t r = 0; r < num_rings; r++) {
+			if (version_ >= GEOSILO_VERSION_3) {
+				DecodeRing();
+			} else {
+				DecodeCoordinateSequence();
 			}
-		}
-		// Reconstruct closing vertex (= first)
-		for (uint32_t d = 0; d < vw_; d++) {
-			WDbl(Unscale(first[d]));
 		}
 	}
 
-	void DecodeGeometry(GeometryType type) {
-		switch (type) {
-		case GeometryType::POINT: {
-			for (uint32_t d = 0; d < vw_; d++) {
-				WDbl(Unscale(RI32()));
-			}
-			break;
+	void DecodePoint() {
+		out_.Ensure(8 * vw_);
+		for (uint32_t d = 0; d < vw_; d++) {
+			out_.PutUnchecked<double>(Unscale(in_->Get<int32_t>()));
 		}
-		case GeometryType::LINESTRING: {
+	}
+
+	void DecodeGeometry(GeometryType type, idx_t depth) {
+		if (ExceedsDepth(type, depth)) {
+			throw InvalidInputException("GeoSilo: geometry exceeds the maximum nesting depth of %llu",
+			                            static_cast<unsigned long long>(GEOSILO_MAX_DEPTH));
+		}
+		switch (type) {
+		case GeometryType::POINT:
+			DecodePoint();
+			break;
+		case GeometryType::LINESTRING:
 			DecodeCoordinateSequence();
 			break;
-		}
-		case GeometryType::POLYGON: {
-			uint32_t num_rings = RU32();
-			WU32(num_rings);
-			for (uint32_t r = 0; r < num_rings; r++) {
-				if (version_ >= GEOSILO_VERSION_3) DecodeRing();
-				else DecodeCoordinateSequence();
-			}
+		case GeometryType::POLYGON:
+			DecodePolygon();
 			break;
-		}
 		case GeometryType::MULTIPOINT: {
-			if (version_ >= GEOSILO_VERSION_2) {
-				DecodeMultiPointDelta();
+			if (MultiPointIsDelta(version_, depth)) {
+				// Delta-encoded points: reverse of EncodeMultiPointDelta.
+				auto num_parts = in_->Count(2 * vw_);
+				out_.Put<uint32_t>(num_parts);
+				int32_t prev[4] = {0, 0, 0, 0};
+				for (uint32_t p = 0; p < num_parts; p++) {
+					WriteWkbHeader(GeometryType::POINT);
+					out_.Ensure(8 * vw_);
+					for (uint32_t d = 0; d < vw_; d++) {
+						prev[d] = (p == 0) ? in_->Get<int32_t>() : WrapAdd(prev[d], Delta());
+						out_.PutUnchecked<double>(Unscale(prev[d]));
+					}
+				}
 			} else {
 				// v1: absolute coords per point
-				uint32_t num_parts = RU32();
-				WU32(num_parts);
-				uint32_t wkb_type = static_cast<uint32_t>(GeometryType::POINT);
-				if (vw_ >= 3) wkb_type |= 0x80000000;
-				if (vw_ == 4) wkb_type |= 0x40000000;
+				auto num_parts = in_->Count(4 * vw_);
+				out_.Put<uint32_t>(num_parts);
 				for (uint32_t p = 0; p < num_parts; p++) {
-					WByte(0x01);
-					WU32(wkb_type);
-					DecodeGeometry(GeometryType::POINT);
+					WriteWkbHeader(GeometryType::POINT);
+					DecodePoint();
 				}
 			}
 			break;
 		}
 		case GeometryType::MULTILINESTRING:
 		case GeometryType::MULTIPOLYGON: {
-			uint32_t num_parts = RU32();
-			WU32(num_parts);
-			auto inner = (type == GeometryType::MULTILINESTRING) ? GeometryType::LINESTRING
-			                                                     : GeometryType::POLYGON;
-			uint32_t wkb_type = static_cast<uint32_t>(inner);
-			if (vw_ >= 3) wkb_type |= 0x80000000;
-			if (vw_ == 4) wkb_type |= 0x40000000;
+			auto num_parts = in_->Count(4);
+			out_.Put<uint32_t>(num_parts);
+			auto inner =
+			    (type == GeometryType::MULTILINESTRING) ? GeometryType::LINESTRING : GeometryType::POLYGON;
 			for (uint32_t p = 0; p < num_parts; p++) {
-				WByte(0x01);
-				WU32(wkb_type);
-				DecodeGeometry(inner);
+				WriteWkbHeader(inner);
+				if (inner == GeometryType::LINESTRING) {
+					DecodeCoordinateSequence();
+				} else {
+					DecodePolygon();
+				}
 			}
 			break;
 		}
 		case GeometryType::GEOMETRYCOLLECTION: {
-			uint32_t num_parts = RU32();
-			WU32(num_parts);
+			auto num_parts = in_->Count(5);
+			out_.Put<uint32_t>(num_parts);
 			for (uint32_t p = 0; p < num_parts; p++) {
-				auto child_type = static_cast<GeometryType>(RByte());
-				WByte(0x01);
-				uint32_t wkb_type = static_cast<uint32_t>(child_type);
-				if (vw_ >= 3) wkb_type |= 0x80000000;
-				if (vw_ == 4) wkb_type |= 0x40000000;
-				WU32(wkb_type);
-				DecodeGeometry(child_type);
+				auto child_type = in_->U8();
+				if (!IsValidGeometryType(child_type)) {
+					throw InvalidInputException("GeoSilo: invalid geometry type %d in collection",
+					                            static_cast<int>(child_type));
+				}
+				WriteWkbHeader(static_cast<GeometryType>(child_type));
+				DecodeGeometry(static_cast<GeometryType>(child_type), depth + 1);
 			}
 			break;
 		}
@@ -972,12 +1201,12 @@ private:
 		}
 	}
 
-	double inv_scale_ = 1.0 / static_cast<double>(DEFAULT_SCALE);
+	double dbl_scale_ = static_cast<double>(DEFAULT_SCALE);
 	uint8_t version_ = GEOSILO_VERSION_1;
 	uint32_t vw_ = 2;
-	const uint8_t *rp_ = nullptr;
-	uint8_t *wp_ = nullptr;
-	vector<uint8_t> buf_;
+	bool has_m_ = false;
+	ByteCursor *in_ = nullptr;
+	ByteBuffer out_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1032,7 +1261,7 @@ static void SiloEncodeWithScaleFunction(DataChunk &args, ExpressionState &state,
 	auto &geom_vec = args.data[0];
 	auto &scale_vec = args.data[1];
 
-	SiloWriter writer(0);
+	SiloWriter writer(DEFAULT_SCALE);
 	BinaryExecutor::Execute<string_t, int64_t, string_t>(
 	    geom_vec, scale_vec, result, [&](string_t geom, int64_t scale) {
 		    writer.SetScale(scale);
@@ -1054,13 +1283,13 @@ static void SiloDecodeFunction(DataChunk &args, ExpressionState &state, Vector &
 	});
 }
 
-// silo_metadata(blob) → STRUCT{geometry_type VARCHAR, vertex_type VARCHAR, scale BIGINT}
-static void SiloMetadataFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	static const char *geom_names[] = {"INVALID", "POINT", "LINESTRING", "POLYGON",
-	                                   "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON",
-	                                   "GEOMETRYCOLLECTION"};
-	static const char *vert_names[] = {"XY", "XYZ", "XYM", "XYZM"};
 
+static const char *const GEOMETRY_TYPE_NAMES[] = {"INVALID",    "POINT",           "LINESTRING",  "POLYGON",
+                                                  "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON", "GEOMETRYCOLLECTION"};
+static const char *const VERTEX_TYPE_NAMES[] = {"XY", "XYZ", "XYM", "XYZM"};
+
+// geosilo_metadata(blob) → STRUCT{geometry_type VARCHAR, vertex_type VARCHAR, scale BIGINT}
+static void SiloMetadataFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &blob_vec = args.data[0];
 	auto &entries = StructVector::GetEntries(result);
 	auto &geom_type_vec = entries[0];
@@ -1076,36 +1305,57 @@ static void SiloMetadataFunction(DataChunk &args, ExpressionState &state, Vector
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto blob_idx = blob_format.sel->get_index(i);
 		if (!blob_format.validity.RowIsValid(blob_idx)) {
+			// Mark the children NULL too, so struct field access on a NULL row yields NULL
 			result_validity.SetInvalid(i);
+			for (auto &entry : entries) {
+				FlatVector::ValidityMutable(entry).SetInvalid(i);
+			}
 			continue;
 		}
 		auto &blob = blob_data[blob_idx];
-		auto data = reinterpret_cast<const uint8_t *>(blob.GetData());
-		auto size = static_cast<idx_t>(blob.GetSize());
-		uint8_t gt, vt;
-		int64_t scale;
-		if (data[0] >= COMPACT_MAGIC_BASE && data[0] <= COMPACT_MAGIC_MAX) {
-			GeometryType geom_type_val;
-			VertexType vert_type_val;
-			double unused;
-			ResolveCompactMagic(data[0], geom_type_val, vert_type_val, unused);
-			gt = static_cast<uint8_t>(geom_type_val);
-			vt = static_cast<uint8_t>(vert_type_val);
-			scale = CompactMagicScale(data[0]);
-		} else if (data[0] == GEOSILO_MAGIC && size >= 12) {
-			gt = data[2];
-			vt = data[3];
-			memcpy(&scale, data + 4, 8);
-		} else {
-			throw InvalidInputException("GeoSilo: invalid blob");
-		}
-
+		auto header =
+		    ParseSiloHeader(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()));
 		FlatVector::GetDataMutable<string_t>(geom_type_vec)[i] =
-		    StringVector::AddString(geom_type_vec, (gt <= 7) ? geom_names[gt] : "UNKNOWN");
+		    StringVector::AddString(geom_type_vec, GEOMETRY_TYPE_NAMES[static_cast<uint8_t>(header.geom_type)]);
 		FlatVector::GetDataMutable<string_t>(vert_type_vec)[i] =
-		    StringVector::AddString(vert_type_vec, (vt <= 3) ? vert_names[vt] : "UNKNOWN");
-		FlatVector::GetDataMutable<int64_t>(scale_vec)[i] = scale;
+		    StringVector::AddString(vert_type_vec, VERTEX_TYPE_NAMES[static_cast<uint8_t>(header.vert_type)]);
+		FlatVector::GetDataMutable<int64_t>(scale_vec)[i] = header.scale;
 	}
+}
+
+// geosilo_is_valid(blob) → BOOLEAN: true when the blob is a structurally valid GEOSILO value
+static void SiloIsValidFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, bool>(args.data[0], result, args.size(), [&](string_t blob) {
+		return ValidateSilo(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()))
+		    .empty();
+	});
+}
+
+// geosilo_validate(blob) → VARCHAR: NULL when valid, otherwise a description of the problem
+static void SiloValidateFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, string_t>(
+	    args.data[0], result, args.size(), [&](string_t blob) -> optional<string_t> {
+		    auto error =
+		        ValidateSilo(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()));
+		    if (error.empty()) {
+			    return nullopt;
+		    }
+		    return StringVector::AddString(result, error);
+	    });
+}
+
+// try_geosilo_decode(blob) → GEOMETRY, NULL when the blob is malformed
+static void SiloTryDecodeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	SiloReader reader;
+	UnaryExecutor::Execute<string_t, string_t>(
+	    args.data[0], result, args.size(), [&](string_t blob) -> optional<string_t> {
+		    try {
+			    return reader.Decode(reinterpret_cast<const uint8_t *>(blob.GetData()),
+			                         static_cast<idx_t>(blob.GetSize()), result);
+		    } catch (InvalidInputException &) {
+			    return nullopt;
+		    }
+	    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,50 +1488,13 @@ static BoundCastInfo BindGeometryToGeoSiloCast(BindCastInput &input, const Logic
 	return BoundCastInfo(GeometryToGeoSiloCast, make_uniq<GeoSiloCastData>(scale));
 }
 
-// Validates the GEOSILO header of a raw BLOB (as returned by geosilo_encode). Returns an empty string when the
-// header is valid, otherwise a description of the problem.
-static string ValidateSiloHeader(const uint8_t *data, idx_t size) {
-	if (size < 1) {
-		return "GeoSilo: blob is empty";
-	}
-	uint8_t magic = data[0];
-	if (magic >= COMPACT_MAGIC_BASE && magic <= COMPACT_MAGIC_MAX) {
-		return string();
-	}
-	if (magic != GEOSILO_MAGIC) {
-		return StringUtil::Format("GeoSilo: invalid magic byte 0x%02x", magic);
-	}
-	if (size < 12) {
-		return "GeoSilo: blob too small for a GEOSILO header";
-	}
-	uint8_t version = data[1];
-	if (version < GEOSILO_VERSION_1 || version > GEOSILO_VERSION_3) {
-		return StringUtil::Format("GeoSilo: unsupported version %d", static_cast<int>(version));
-	}
-	uint8_t geom_type = data[2];
-	if (geom_type < static_cast<uint8_t>(GeometryType::POINT) ||
-	    geom_type > static_cast<uint8_t>(GeometryType::GEOMETRYCOLLECTION)) {
-		return StringUtil::Format("GeoSilo: invalid geometry type %d", static_cast<int>(geom_type));
-	}
-	uint8_t vert_type = data[3];
-	if (vert_type > static_cast<uint8_t>(VertexType::XYZM)) {
-		return StringUtil::Format("GeoSilo: invalid vertex type %d", static_cast<int>(vert_type));
-	}
-	int64_t scale;
-	memcpy(&scale, data + 4, 8);
-	if (scale <= 0) {
-		return "GeoSilo: invalid scale in header";
-	}
-	return string();
-}
 
-// BLOB → GEOSILO (explicit only): accepts the raw output of geosilo_encode after validating its header.
-// The GEOSILO binary is self-describing, so the bytes are copied unchanged.
+// BLOB → GEOSILO (explicit only): accepts the raw output of geosilo_encode after validating the whole blob
+// (header, structure, counts). The GEOSILO binary is self-describing, so the bytes are copied unchanged.
 static bool BlobToGeoSiloCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	bool all_converted = true;
 	UnaryExecutor::Execute<string_t, string_t>(source, result, count, [&](string_t blob) -> optional<string_t> {
-		auto error =
-		    ValidateSiloHeader(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()));
+		auto error = ValidateSilo(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()));
 		if (!error.empty()) {
 			// Throws for CAST; records the error and yields NULL for TRY_CAST
 			HandleCastError::AssignError(error, parameters);
@@ -1295,14 +1508,12 @@ static bool BlobToGeoSiloCast(Vector &source, Vector &result, idx_t count, CastP
 
 // GEOSILO → VARCHAR (decode to WKB, then to WKT for display)
 static bool GeoSiloToVarcharCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
-	// First decode to WKB in a temporary vector
 	Vector geom_vec(LogicalType::GEOMETRY(), count);
 	SiloReader reader;
 	UnaryExecutor::Execute<string_t, string_t>(source, geom_vec, count, [&](string_t blob) {
-		return reader.Decode(reinterpret_cast<const uint8_t *>(blob.GetData()),
-		                     static_cast<idx_t>(blob.GetSize()), geom_vec);
+		return reader.Decode(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()),
+		                     geom_vec);
 	});
-	// Then convert GEOMETRY to WKT string
 	UnaryExecutor::Execute<string_t, string_t>(geom_vec, result, count, [&](string_t geom) {
 		return Geometry::ToString(StringVector::GetStringHeap(result), geom);
 	});
@@ -1312,281 +1523,135 @@ static bool GeoSiloToVarcharCast(Vector &source, Vector &result, idx_t count, Ca
 // ---------------------------------------------------------------------------
 // Direct ST_* function implementations on GEOSILO binary
 // ---------------------------------------------------------------------------
+// Semantics follow the spatial extension's GEOMETRY overloads: NULL for an empty geometry where spatial
+// returns NULL, 0 for area/length/perimeter of geometries without that dimension.
 
-// Helper: parse header from silo blob, returns geometry type enum and inv_scale
-static GeometryType ParseSiloHeader(const uint8_t *data, idx_t size, double &inv_scale) {
-	if (size < 1) throw InvalidInputException("GeoSilo: blob too small");
-	uint8_t magic = data[0];
-	GeometryType geom_type;
-	VertexType vert_type;
-	if (magic >= COMPACT_MAGIC_BASE && magic <= COMPACT_MAGIC_MAX) {
-		ResolveCompactMagic(magic, geom_type, vert_type, inv_scale);
-	} else if (magic == GEOSILO_MAGIC && size >= 12) {
-		geom_type = static_cast<GeometryType>(data[2]);
-		int64_t scale;
-		memcpy(&scale, data + 4, 8);
-		inv_scale = 1.0 / static_cast<double>(scale);
-	} else {
-		throw InvalidInputException("GeoSilo: invalid blob");
-	}
-	return geom_type;
+static inline const uint8_t *BlobData(const string_t &blob) {
+	return reinterpret_cast<const uint8_t *>(blob.GetData());
+}
+static inline idx_t BlobSize(const string_t &blob) {
+	return static_cast<idx_t>(blob.GetSize());
 }
 
 // ST_GeometryType(GEOSILO) → VARCHAR
 static void GeoSiloSTGeometryType(DataChunk &args, ExpressionState &state, Vector &result) {
-	static const char *geom_names[] = {"INVALID", "POINT", "LINESTRING", "POLYGON",
-	                                   "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON",
-	                                   "GEOMETRYCOLLECTION"};
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, string_t>(blob_vec, result, [&](string_t blob) {
-		double unused;
-		auto gt = ParseSiloHeader(reinterpret_cast<const uint8_t *>(blob.GetData()),
-		                          static_cast<idx_t>(blob.GetSize()), unused);
-		auto idx = static_cast<uint8_t>(gt);
-		return StringVector::AddString(result, (idx <= 7) ? geom_names[idx] : "UNKNOWN");
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t blob) {
+		auto header = ParseSiloHeader(BlobData(blob), BlobSize(blob));
+		return StringVector::AddString(result, GEOMETRY_TYPE_NAMES[static_cast<uint8_t>(header.geom_type)]);
 	});
 }
 
-// ST_IsEmpty(GEOSILO) → BOOL
+// ST_IsEmpty(GEOSILO) → BOOL: true when the geometry has no vertices
 static void GeoSiloSTIsEmpty(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, bool>(blob_vec, result, [&](string_t blob) {
-		auto data = reinterpret_cast<const uint8_t *>(blob.GetData());
-		auto size = static_cast<idx_t>(blob.GetSize());
-		double inv_scale;
-		auto gt = ParseSiloHeader(data, size, inv_scale);
-
-		// Determine body offset
-		idx_t offset = (data[0] >= COMPACT_MAGIC_BASE && data[0] <= COMPACT_MAGIC_MAX) ? 1 : 12;
-		if (gt == GeometryType::POINT) {
-			// Empty point: first coord is EMPTY_COORD sentinel
-			if (offset + 4 > size) return true;
-			int32_t x;
-			memcpy(&x, data + offset, 4);
-			return x == EMPTY_COORD;
+	UnaryExecutor::Execute<string_t, bool>(args.data[0], result, args.size(), [&](string_t blob) {
+		auto data = BlobData(blob);
+		auto size = BlobSize(blob);
+		auto header = ParseSiloHeader(data, size);
+		ByteCursor cur(data + header.body_offset, size - header.body_offset, "GeoSilo");
+		if (header.geom_type == GeometryType::POINT) {
+			return cur.Get<int32_t>() == EMPTY_COORD;
 		}
-		// For other types: check if count is 0
-		if (offset + 4 > size) return true;
-		uint32_t count;
-		memcpy(&count, data + offset, 4);
-		return count == 0;
+		auto top_count = cur.Get<uint32_t>();
+		if (top_count == 0) {
+			return true;
+		}
+		if (header.geom_type == GeometryType::LINESTRING) {
+			return false;
+		}
+		// Polygons, multi-geometries and collections may consist solely of empty parts.
+		CountVisitor vis;
+		SiloWalker<CountVisitor> walker(data, size, vis);
+		walker.Walk();
+		return vis.count == 0;
 	});
 }
 
-// ST_NPoints(GEOSILO) → INTEGER
-// Walk the structure reading count fields, skip over coordinate data
+// ST_NPoints(GEOSILO) → INTEGER: total vertex count, counting ring closures like the WKB representation
 static void GeoSiloSTNPoints(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, int32_t>(blob_vec, result, [&](string_t blob) -> int32_t {
-		auto data = reinterpret_cast<const uint8_t *>(blob.GetData());
-		auto size = static_cast<idx_t>(blob.GetSize());
-		double inv_scale;
-		auto gt = ParseSiloHeader(data, size, inv_scale);
-
-		uint8_t magic = data[0];
-		bool is_compact = (magic >= COMPACT_MAGIC_BASE && magic <= COMPACT_MAGIC_MAX);
-		uint8_t version = is_compact ? GEOSILO_VERSION_3 : (magic == GEOSILO_MAGIC ? data[1] : GEOSILO_VERSION_1);
-		bool ring_closure = (version >= GEOSILO_VERSION_3);
-		idx_t offset = is_compact ? 1 : 12;
-
-		// Determine vertex width
-		uint32_t vw = 2;
-		if (is_compact) {
-			uint8_t variant = (magic - COMPACT_MAGIC_BASE) % 4;
-			if (variant & 1) vw = 3; // XYZ
-		} else if (size >= 4) {
-			auto vt = static_cast<VertexType>(data[3]);
-			if (vt == VertexType::XYZ || vt == VertexType::XYZM) vw++;
-			if (vt == VertexType::XYM || vt == VertexType::XYZM) vw++;
+	UnaryExecutor::Execute<string_t, int32_t>(args.data[0], result, args.size(), [&](string_t blob) {
+		CountVisitor vis;
+		SiloWalker<CountVisitor> walker(BlobData(blob), BlobSize(blob), vis);
+		walker.Walk();
+		if (vis.count > std::numeric_limits<int32_t>::max()) {
+			throw InvalidInputException("ST_NPoints: vertex count overflows INTEGER");
 		}
-
-		// Count points by walking the structure
-		// This is a simplified count — for full accuracy on all types we'd need
-		// a recursive walker, but for the common cases this works:
-		if (gt == GeometryType::POINT) return 1;
-		if (gt == GeometryType::LINESTRING) {
-			if (offset + 4 > size) return 0;
-			uint32_t n;
-			memcpy(&n, data + offset, 4);
-			return static_cast<int32_t>(n);
-		}
-		// For POLYGON and more complex types, fall back to full decode count
-		// This is still faster than full WKB decode since we only read counts
-		SiloReader reader;
-		Vector temp(LogicalType::GEOMETRY(), 1);
-		auto geom = reader.Decode(data, size, temp);
-		// Count points from WKB — use the fact that ST_NPoints is cheap on WKB
-		// Actually, let's just walk the silo structure properly
-		// For now, decode and count — we'll optimize later with SiloWalker
-		auto geom_data = reinterpret_cast<const uint8_t *>(geom.GetData());
-		auto geom_size = static_cast<idx_t>(geom.GetSize());
-		// WKB point count: total doubles / vertex_width (minus headers)
-		// Simpler: count from silo structure directly
-		// For polygon: sum ring counts + ring_closure adjustments
-		if (gt == GeometryType::POLYGON) {
-			uint32_t num_rings;
-			memcpy(&num_rings, data + offset, 4);
-			offset += 4;
-			int32_t total = 0;
-			for (uint32_t r = 0; r < num_rings && offset + 4 <= size; r++) {
-				uint32_t n;
-				memcpy(&n, data + offset, 4);
-				total += ring_closure ? (n + 1) : n; // v3 stores n-1, add closure back
-				offset += 4;
-				// Skip coordinate data: first vertex absolute + remaining deltas
-				if (n == 0) continue;
-				offset += vw * 4; // first vertex
-				for (uint32_t i = 1; i < n; i++) {
-					for (uint32_t d = 0; d < vw; d++) {
-						int16_t delta;
-						if (offset + 2 > size) break;
-						memcpy(&delta, data + offset, 2);
-						offset += 2;
-						if (delta == DELTA_ESCAPE) offset += 4;
-					}
-				}
-			}
-			return total;
-		}
-		// For multi* and collection types, decode and count from WKB
-		// (optimize later with SiloWalker)
-		{
-			SiloReader rdr;
-			Vector temp(LogicalType::GEOMETRY(), 1);
-			auto geom_str = rdr.Decode(data, size, temp);
-			auto gdata = reinterpret_cast<const uint8_t *>(geom_str.GetData());
-			auto gsize = static_cast<idx_t>(geom_str.GetSize());
-			// Simple WKB point count: count all 16-byte coordinate pairs
-			// after removing headers. For exact count, just return the sum
-			// from the silo structure walk above for polygon.
-			// For multi* types with unknown structure, fall back:
-			(void)gdata; (void)gsize;
-			return 0; // placeholder for complex types
-		}
+		return static_cast<int32_t>(vis.count);
 	});
 }
 
-// ST_X(GEOSILO) → DOUBLE (POINT only)
-static void GeoSiloSTX(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
-		auto data = reinterpret_cast<const uint8_t *>(blob.GetData());
-		auto size = static_cast<idx_t>(blob.GetSize());
-		double inv_scale;
-		auto gt = ParseSiloHeader(data, size, inv_scale);
-		if (gt != GeometryType::POINT) {
-			throw InvalidInputException("ST_X: geometry is not a POINT");
-		}
-		idx_t offset = (data[0] >= COMPACT_MAGIC_BASE && data[0] <= COMPACT_MAGIC_MAX) ? 1 : 12;
-		if (offset + 4 > size) return std::numeric_limits<double>::quiet_NaN();
-		int32_t x;
-		memcpy(&x, data + offset, 4);
-		if (x == EMPTY_COORD) return std::numeric_limits<double>::quiet_NaN();
-		return static_cast<double>(x) * inv_scale;
-	});
+// ST_X / ST_Y (GEOSILO) → DOUBLE: coordinate of a POINT; NULL for an empty POINT, error for other types
+template <idx_t AXIS>
+static void GeoSiloSTCoord(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, double>(
+	    args.data[0], result, args.size(), [&](string_t blob) -> optional<double> {
+		    auto data = BlobData(blob);
+		    auto size = BlobSize(blob);
+		    auto header = ParseSiloHeader(data, size);
+		    if (header.geom_type != GeometryType::POINT) {
+			    throw InvalidInputException("%s: geometry is not a POINT (got %s)", AXIS == 0 ? "ST_X" : "ST_Y",
+			                                GEOMETRY_TYPE_NAMES[static_cast<uint8_t>(header.geom_type)]);
+		    }
+		    ByteCursor cur(data + header.body_offset, size - header.body_offset, "GeoSilo");
+		    auto x = cur.Get<int32_t>();
+		    auto y = cur.Get<int32_t>();
+		    auto v = AXIS == 0 ? x : y;
+		    if (x == EMPTY_COORD || v == EMPTY_COORD) {
+			    return nullopt;
+		    }
+		    return static_cast<double>(v) / header.dbl_scale;
+	    });
 }
 
-// ST_Y(GEOSILO) → DOUBLE (POINT only)
-static void GeoSiloSTY(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
-		auto data = reinterpret_cast<const uint8_t *>(blob.GetData());
-		auto size = static_cast<idx_t>(blob.GetSize());
-		double inv_scale;
-		auto gt = ParseSiloHeader(data, size, inv_scale);
-		if (gt != GeometryType::POINT) {
-			throw InvalidInputException("ST_Y: geometry is not a POINT");
-		}
-		idx_t offset = (data[0] >= COMPACT_MAGIC_BASE && data[0] <= COMPACT_MAGIC_MAX) ? 1 : 12;
-		offset += 4; // skip X
-		if (offset + 4 > size) return std::numeric_limits<double>::quiet_NaN();
-		int32_t y;
-		memcpy(&y, data + offset, 4);
-		if (y == EMPTY_COORD) return std::numeric_limits<double>::quiet_NaN();
-		return static_cast<double>(y) * inv_scale;
-	});
+// Bounding box: NULL for empty geometries
+enum class BBoxField : uint8_t { XMIN, XMAX, YMIN, YMAX };
+
+template <BBoxField FIELD>
+static void GeoSiloSTBBox(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, double>(
+	    args.data[0], result, args.size(), [&](string_t blob) -> optional<double> {
+		    BBoxVisitor vis;
+		    SiloWalker<BBoxVisitor> walker(BlobData(blob), BlobSize(blob), vis);
+		    walker.Walk();
+		    if (!vis.has_points) {
+			    return nullopt;
+		    }
+		    int32_t v;
+		    switch (FIELD) {
+		    case BBoxField::XMIN:
+			    v = vis.xmin;
+			    break;
+		    case BBoxField::XMAX:
+			    v = vis.xmax;
+			    break;
+		    case BBoxField::YMIN:
+			    v = vis.ymin;
+			    break;
+		    default:
+			    v = vis.ymax;
+			    break;
+		    }
+		    return static_cast<double>(v) / walker.dbl_scale();
+	    });
 }
-
-// --- Phase 3: Bounding box functions ---
-
-static void GeoSiloSTXMin(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
-		BBoxVisitor vis;
-		SiloWalker<BBoxVisitor> walker;
-		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
-		if (!vis.has_points) return std::numeric_limits<double>::quiet_NaN();
-		return static_cast<double>(vis.xmin) * walker.inv_scale();
-	});
-}
-
-static void GeoSiloSTXMax(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
-		BBoxVisitor vis;
-		SiloWalker<BBoxVisitor> walker;
-		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
-		if (!vis.has_points) return std::numeric_limits<double>::quiet_NaN();
-		return static_cast<double>(vis.xmax) * walker.inv_scale();
-	});
-}
-
-static void GeoSiloSTYMin(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
-		BBoxVisitor vis;
-		SiloWalker<BBoxVisitor> walker;
-		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
-		if (!vis.has_points) return std::numeric_limits<double>::quiet_NaN();
-		return static_cast<double>(vis.ymin) * walker.inv_scale();
-	});
-}
-
-static void GeoSiloSTYMax(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
-		BBoxVisitor vis;
-		SiloWalker<BBoxVisitor> walker;
-		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
-		if (!vis.has_points) return std::numeric_limits<double>::quiet_NaN();
-		return static_cast<double>(vis.ymax) * walker.inv_scale();
-	});
-}
-
-// --- Phase 4: Computational functions ---
 
 static void GeoSiloSTArea(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
+	UnaryExecutor::Execute<string_t, double>(args.data[0], result, args.size(), [&](string_t blob) {
 		AreaVisitor vis;
-		SiloWalker<AreaVisitor> walker;
-		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
-		// Convert from scaled integer area to real-world area
-		// twice_area is in scaled units squared, so divide by scale^2
-		double scale_sq = 1.0 / (walker.inv_scale() * walker.inv_scale());
-		return std::abs(static_cast<double>(vis.twice_area)) / (2.0 * scale_sq);
+		SiloWalker<AreaVisitor> walker(BlobData(blob), BlobSize(blob), vis);
+		walker.Walk();
+		// The shoelace sum is twice the area in scaled units squared.
+		double sc = walker.dbl_scale();
+		return vis.total * 0.5 / (sc * sc);
 	});
 }
 
-static void GeoSiloSTLength(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
-		LengthVisitor vis;
-		SiloWalker<LengthVisitor> walker;
-		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
-		// Length is in scaled units, convert to real-world units
-		return vis.total_length * walker.inv_scale();
-	});
-}
-
-static void GeoSiloSTPerimeter(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &blob_vec = args.data[0];
-	UnaryExecutor::Execute<string_t, double>(blob_vec, result, [&](string_t blob) -> double {
-		// Perimeter is the same as length for polygon rings (including closure)
-		LengthVisitor vis;
-		SiloWalker<LengthVisitor> walker;
-		walker.Walk(reinterpret_cast<const uint8_t *>(blob.GetData()), static_cast<idx_t>(blob.GetSize()), vis);
-		return vis.total_length * walker.inv_scale();
+template <bool POLYGONAL>
+static void GeoSiloSTLengthImpl(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, double>(args.data[0], result, args.size(), [&](string_t blob) {
+		LengthVisitor<POLYGONAL> vis;
+		SiloWalker<LengthVisitor<POLYGONAL>> walker(BlobData(blob), BlobSize(blob), vis);
+		walker.Walk();
+		return vis.total_length / walker.dbl_scale();
 	});
 }
 
@@ -1616,7 +1681,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// GEOSILO → VARCHAR (implicit, high cost — for display)
 	loader.RegisterCastFunction(geosilo_type, LogicalType::VARCHAR,
 	                            BoundCastInfo(GeoSiloToVarcharCast), 10000);
-	// BLOB → GEOSILO (explicit only — e.g. geosilo_encode(...)::GEOSILO); validates the header
+	// BLOB → GEOSILO (explicit only — e.g. geosilo_encode(...)::GEOSILO); validates the whole blob
 	loader.RegisterCastFunction(LogicalType::BLOB, geosilo_type, BoundCastInfo(BlobToGeoSiloCast));
 
 	// --- geosilo_encode (overloaded: with and without scale) ---
@@ -1645,9 +1710,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	encode_info.descriptions.push_back({
 	    {LogicalType::GEOMETRY(), LogicalType::BIGINT},
 	    {"geometry", "scale"},
-	    "Encodes a GEOMETRY into GEOSILO using a caller-supplied integer scale. Each coordinate is multiplied by `scale` and rounded to int64 before delta-encoding, "
+	    "Encodes a GEOMETRY into GEOSILO using a caller-supplied integer scale. Each coordinate is multiplied by `scale` and rounded to a 32-bit integer before delta-encoding, "
 	    "so a scale of 1e6 keeps 6 decimal digits of precision, 1e7 keeps 7, etc. "
-	    "Larger scales preserve more precision; encoding fails if any scaled coordinate overflows int64.",
+	    "Larger scales preserve more precision; `scale` must be positive, and encoding fails if any scaled coordinate falls outside the 32-bit integer range "
+	    "(about ±214 at scale 1e7, ±21,474,836 at scale 100).",
 	    {"geosilo_encode(ST_Point(1.234, 5.678), 1000000)",
 	     "geosilo_encode(ST_GeomFromText('LINESTRING(500000.25 4649776.75, 500010.5 4649780)'), 100)"},
 	    {"geosilo", "geometry", "encoding"}
@@ -1716,6 +1782,37 @@ static void LoadInternal(ExtensionLoader &loader) {
 	});
 	loader.RegisterFunction(metadata_info);
 
+	// --- geosilo_is_valid / geosilo_validate / try_geosilo_decode (accept GEOSILO or BLOB) ---
+	auto register_blob_fn = [&](const char *name, scalar_function_t fn, const LogicalType &return_type,
+	                            const char *desc, vector<string> examples, bool fallible) {
+		ScalarFunctionSet set(name);
+		set.AddFunction(ScalarFunction(name, {Positional("geom", geosilo_type)}, return_type, fn));
+		set.AddFunction(ScalarFunction(name, {Positional("blob", LogicalType::BLOB)}, return_type, fn));
+		if (fallible) {
+			set.SetFallible();
+		}
+		CreateScalarFunctionInfo info(std::move(set));
+		info.descriptions.push_back({{geosilo_type}, {"geom"}, desc, examples, {"geosilo", "validation"}});
+		info.descriptions.push_back({{LogicalType::BLOB}, {"blob"}, desc, examples, {"geosilo", "validation"}});
+		loader.RegisterFunction(info);
+	};
+	register_blob_fn("geosilo_is_valid", SiloIsValidFunction, LogicalType::BOOLEAN,
+	                 "Returns true when the value is a structurally valid GEOSILO blob: a known header, element "
+	                 "counts consistent with the data, supported nesting depth and no trailing bytes. Never raises "
+	                 "an error for malformed input, so it can be used to filter untrusted BLOBs before decoding.",
+	                 {"geosilo_is_valid(geosilo_encode(ST_Point(1, 2)))", "geosilo_is_valid('\\x00\\x01'::BLOB)"},
+	                 false);
+	register_blob_fn("geosilo_validate", SiloValidateFunction, LogicalType::VARCHAR,
+	                 "Validates a GEOSILO blob and returns NULL when it is valid, otherwise a message describing the "
+	                 "first problem found (truncated data, bad magic byte, unsupported version, invalid count, ...).",
+	                 {"geosilo_validate(geosilo_encode(ST_Point(1, 2)))", "geosilo_validate('\\x47\\x01'::BLOB)"},
+	                 false);
+	register_blob_fn("try_geosilo_decode", SiloTryDecodeFunction, LogicalType::GEOMETRY(),
+	                 "Decodes a GEOSILO blob into a GEOMETRY like geosilo_decode, but returns NULL instead of raising "
+	                 "an error when the blob is malformed.",
+	                 {"try_geosilo_decode(geosilo_encode(ST_Point(1, 2)))", "try_geosilo_decode('\\x54\\xff'::BLOB)"},
+	                 false);
+
 	// --- ST_* function overloads (direct on GEOSILO, no decode) ---
 	auto register_st = [&](const char *name, ScalarFunction fn, const char *param_name,
 	                       const char *desc, vector<string> examples, vector<string> categories) {
@@ -1755,53 +1852,54 @@ static void LoadInternal(ExtensionLoader &loader) {
 	register_st("ST_NPoints",
 	    ScalarFunction("ST_NPoints", {Positional("geom", geosilo_type)}, LogicalType::INTEGER, GeoSiloSTNPoints),
 	    "geom",
-	    "Returns the total number of vertices in the encoded geometry, including all rings and sub-geometries.",
+	    "Returns the total number of vertices in the encoded geometry, including all rings and sub-geometries "
+	    "(polygon rings count their closing vertex, empty points count as 0).",
 	    {"ST_NPoints(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'))::GEOSILO)"},
 	    {"geosilo", "geometry", "spatial"});
 
 	// Phase 2: POINT coordinate access
 	register_st("ST_X",
-	    ScalarFunction("ST_X", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTX),
+	    ScalarFunction("ST_X", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTCoord<0>),
 	    "geom",
 	    "Returns the X coordinate of a POINT geometry. "
-	    "Returns NULL for non-POINT or empty geometries.",
+	    "Returns NULL for an empty POINT and raises an error for non-POINT geometries.",
 	    {"ST_X(geosilo_encode(ST_Point(1.5, 2.5))::GEOSILO)"},
 	    {"geosilo", "geometry", "spatial"});
 
 	register_st("ST_Y",
-	    ScalarFunction("ST_Y", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTY),
+	    ScalarFunction("ST_Y", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTCoord<1>),
 	    "geom",
 	    "Returns the Y coordinate of a POINT geometry. "
-	    "Returns NULL for non-POINT or empty geometries.",
+	    "Returns NULL for an empty POINT and raises an error for non-POINT geometries.",
 	    {"ST_Y(geosilo_encode(ST_Point(1.5, 2.5))::GEOSILO)"},
 	    {"geosilo", "geometry", "spatial"});
 
 	// Phase 3: Bounding box
 	register_st("ST_XMin",
-	    ScalarFunction("ST_XMin", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTXMin),
+	    ScalarFunction("ST_XMin", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTBBox<BBoxField::XMIN>),
 	    "geom",
-	    "Returns the minimum X coordinate of the geometry's bounding box.",
+	    "Returns the minimum X coordinate of the geometry's bounding box, or NULL for an empty geometry.",
 	    {"ST_XMin(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO)"},
 	    {"geosilo", "geometry", "spatial", "bbox"});
 
 	register_st("ST_XMax",
-	    ScalarFunction("ST_XMax", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTXMax),
+	    ScalarFunction("ST_XMax", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTBBox<BBoxField::XMAX>),
 	    "geom",
-	    "Returns the maximum X coordinate of the geometry's bounding box.",
+	    "Returns the maximum X coordinate of the geometry's bounding box, or NULL for an empty geometry.",
 	    {"ST_XMax(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO)"},
 	    {"geosilo", "geometry", "spatial", "bbox"});
 
 	register_st("ST_YMin",
-	    ScalarFunction("ST_YMin", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTYMin),
+	    ScalarFunction("ST_YMin", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTBBox<BBoxField::YMIN>),
 	    "geom",
-	    "Returns the minimum Y coordinate of the geometry's bounding box.",
+	    "Returns the minimum Y coordinate of the geometry's bounding box, or NULL for an empty geometry.",
 	    {"ST_YMin(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO)"},
 	    {"geosilo", "geometry", "spatial", "bbox"});
 
 	register_st("ST_YMax",
-	    ScalarFunction("ST_YMax", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTYMax),
+	    ScalarFunction("ST_YMax", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTBBox<BBoxField::YMAX>),
 	    "geom",
-	    "Returns the maximum Y coordinate of the geometry's bounding box.",
+	    "Returns the maximum Y coordinate of the geometry's bounding box, or NULL for an empty geometry.",
 	    {"ST_YMax(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 5 5)'))::GEOSILO)"},
 	    {"geosilo", "geometry", "spatial", "bbox"});
 
@@ -1809,24 +1907,26 @@ static void LoadInternal(ExtensionLoader &loader) {
 	register_st("ST_Area",
 	    ScalarFunction("ST_Area", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTArea),
 	    "geom",
-	    "Returns the planar area of a (MULTI)POLYGON geometry in the units of its coordinate system. "
-	    "Returns 0 for non-areal geometries.",
+	    "Returns the planar area of the polygonal parts of the geometry in the units of its coordinate system "
+	    "(exterior ring area minus hole area, summed over all polygons, including those inside a GEOMETRYCOLLECTION). "
+	    "Returns 0 for points and linestrings.",
 	    {"ST_Area(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))'))::GEOSILO)"},
 	    {"geosilo", "geometry", "spatial"});
 
 	register_st("ST_Length",
-	    ScalarFunction("ST_Length", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTLength),
+	    ScalarFunction("ST_Length", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTLengthImpl<false>),
 	    "geom",
-	    "Returns the planar length of a (MULTI)LINESTRING in the units of its coordinate system. "
-	    "Returns 0 for non-linear geometries.",
+	    "Returns the planar length of the linear parts of the geometry (LINESTRING, MULTILINESTRING and linestrings "
+	    "inside a GEOMETRYCOLLECTION) in the units of its coordinate system. Returns 0 for points and polygons "
+	    "(use ST_Perimeter for polygon boundaries).",
 	    {"ST_Length(geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 3 4)'))::GEOSILO)"},
 	    {"geosilo", "geometry", "spatial"});
 
 	register_st("ST_Perimeter",
-	    ScalarFunction("ST_Perimeter", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTPerimeter),
+	    ScalarFunction("ST_Perimeter", {Positional("geom", geosilo_type)}, LogicalType::DOUBLE, GeoSiloSTLengthImpl<true>),
 	    "geom",
-	    "Returns the planar perimeter of a (MULTI)POLYGON, summed across all rings. "
-	    "Returns 0 for non-areal geometries.",
+	    "Returns the planar perimeter of the polygonal parts of the geometry, summed across all rings (holes included). "
+	    "Returns 0 for points and linestrings.",
 	    {"ST_Perimeter(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))'))::GEOSILO)"},
 	    {"geosilo", "geometry", "spatial"});
 
@@ -1851,7 +1951,7 @@ std::string GeosiloExtension::Name() {
 }
 
 std::string GeosiloExtension::Version() const {
-	return "2026102102";
+	return GEOSILO_EXTENSION_VERSION;
 }
 
 } // namespace duckdb

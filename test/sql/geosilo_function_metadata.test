@@ -1,0 +1,36 @@
+# name: test/sql/geosilo_function_metadata.test
+# description: every geosilo function (and every GEOSILO ST_* overload) has a description, examples and categories
+# group: [geosilo]
+
+require geosilo
+
+# All functions registered by the extension: geosilo_* / try_geosilo_* plus the ST_* overloads taking GEOSILO.
+# (Without spatial loaded, the ST_* functions only have the GEOSILO overload.)
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE (function_name LIKE '%geosilo%' OR list_contains(parameter_types, 'GEOSILO'))
+  AND (description IS NULL OR description = '' OR examples IS NULL OR len(examples) = 0
+       OR categories IS NULL OR NOT list_contains(categories, 'geosilo'));
+----
+0
+
+query I
+SELECT count(DISTINCT function_name) FROM duckdb_functions()
+WHERE function_name LIKE '%geosilo%' OR list_contains(parameter_types, 'GEOSILO');
+----
+18
+
+# No parameter is reported with a generated col<N> name
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE (function_name LIKE '%geosilo%' OR list_contains(parameter_types, 'GEOSILO'))
+  AND list_has_any(parameters, ['col0', 'col1']);
+----
+0
+
+# Decoding and validation are deterministic (not volatile)
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE (function_name LIKE '%geosilo%' OR list_contains(parameter_types, 'GEOSILO')) AND stability <> 'CONSISTENT';
+----
+0

@@ -1,0 +1,255 @@
+# name: test/sql/geosilo_st_semantics.test
+# description: GEOSILO ST_* overloads match the spatial extension's GEOMETRY semantics (offline: core GEOMETRY only)
+# group: [geosilo]
+
+require geosilo
+
+statement ok
+CREATE MACRO gs(wkt, s := 10000000) AS geosilo_encode(wkt::GEOMETRY, s)::GEOSILO;
+
+# --- ST_Area: polygonal parts only, exterior minus holes regardless of ring orientation ---
+
+query IIIIII
+SELECT ST_Area(gs('LINESTRING (0 0, 3 0, 3 4)')),
+       ST_Area(gs('POINT (1 1)')),
+       ST_Area(gs('POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0), (2 2, 2 4, 4 4, 4 2, 2 2))')),
+       ST_Area(gs('POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0), (2 2, 8 2, 8 8, 2 8, 2 2))')),
+       ST_Area(gs('MULTIPOLYGON (((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 4 2, 4 4, 2 4, 2 2)))')),
+       ST_Area(gs('GEOMETRYCOLLECTION (LINESTRING (0 0, 5 5), POLYGON ((0 0, 4 0, 4 3, 0 3, 0 0)), POINT (9 9))'));
+----
+0.0	0.0	96.0	64.0	5.0	12.0
+
+# Large polygon at scale 1e7 (the int64 shoelace accumulator used to be at risk of overflow)
+query II
+SELECT ST_Area(gs('POLYGON ((-170 -80, 170 -80, 170 80, -170 80, -170 -80))')),
+       ST_Area(gs('POLYGON ((-179.9999999 -89.9999999, 179.9999999 -89.9999999, 179.9999999 89.9999999, -179.9999999 89.9999999, -179.9999999 -89.9999999))')) > 64799;
+----
+54400.0	true
+
+# --- ST_Length: linear parts only ---
+
+query IIIII
+SELECT ST_Length(gs('LINESTRING (0 0, 3 4)')),
+       ST_Length(gs('POLYGON ((0 0, 4 0, 4 3, 0 3, 0 0))')),
+       ST_Length(gs('MULTILINESTRING ((0 0, 3 4), (0 0, 0 2))')),
+       ST_Length(gs('GEOMETRYCOLLECTION (LINESTRING (0 0, 3 4), POLYGON ((0 0, 1 0, 1 1, 0 0)))')),
+       ST_Length(gs('POINT (1 2)'));
+----
+5.0	0.0	7.0	5.0	0.0
+
+# Crossing the antimeridian: the int32 delta between -179 and 179 at scale 1e7 overflows; the result must not
+query II
+SELECT ST_Length(gs('LINESTRING (-179 0, 179 0)')), ST_AsText(geosilo_decode(gs('LINESTRING (-179 0, 179 0, -179 1)')));
+----
+358.0	LINESTRING (-179 0, 179 0, -179 1)
+
+query II
+SELECT ST_XMin(gs('MULTIPOINT (-179.5 0, 179.5 0)')), ST_XMax(gs('MULTIPOINT (-179.5 0, 179.5 0)'));
+----
+-179.5	179.5
+
+# --- ST_Perimeter: polygon rings only (holes included) ---
+
+query IIII
+SELECT ST_Perimeter(gs('POLYGON ((0 0, 4 0, 4 3, 0 3, 0 0))')),
+       ST_Perimeter(gs('POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0), (2 2, 2 4, 4 4, 4 2, 2 2))')),
+       ST_Perimeter(gs('LINESTRING (0 0, 3 4)')),
+       ST_Perimeter(gs('GEOMETRYCOLLECTION (LINESTRING (0 0, 3 4), POLYGON ((0 0, 4 0, 4 3, 0 0)))'));
+----
+14.0	48.0	0.0	12.0
+
+# --- ST_NPoints: every vertex, ring closures included, empty points excluded ---
+
+query IIIIIIII
+SELECT ST_NPoints(gs('POINT (1 2)')),
+       ST_NPoints(gs('POINT EMPTY')),
+       ST_NPoints(gs('LINESTRING (0 0, 1 1, 2 2)')),
+       ST_NPoints(gs('POLYGON ((0 0, 10 0, 10 10, 0 0), (1 1, 2 1, 2 2, 1 1))')),
+       ST_NPoints(gs('MULTIPOINT (0 0, 1 1, 2 2)')),
+       ST_NPoints(gs('MULTILINESTRING ((0 0, 1 1), (2 2, 3 3, 4 4))')),
+       ST_NPoints(gs('MULTIPOLYGON (((0 0, 1 0, 1 1, 0 0)), ((2 2, 3 2, 3 3, 2 2)))')),
+       ST_NPoints(gs('GEOMETRYCOLLECTION (POINT (1 2), LINESTRING (0 0, 1 1), GEOMETRYCOLLECTION (MULTIPOINT (5 5, 6 6)))'));
+----
+1	0	3	8	3	5	8	5
+
+# --- ST_IsEmpty ---
+
+query IIIIII
+SELECT ST_IsEmpty(gs('POINT EMPTY')), ST_IsEmpty(gs('POINT (1 2)')), ST_IsEmpty(gs('LINESTRING EMPTY')),
+       ST_IsEmpty(gs('POLYGON EMPTY')), ST_IsEmpty(gs('GEOMETRYCOLLECTION (POINT EMPTY)')),
+       ST_IsEmpty(gs('GEOMETRYCOLLECTION (POINT EMPTY, POINT (1 1))'));
+----
+true	false	true	true	true	false
+
+# --- ST_X / ST_Y: NULL for an empty POINT, an error for other geometry types (as in spatial) ---
+
+query IIII
+SELECT ST_X(gs('POINT (1.5 2.5)')), ST_Y(gs('POINT (1.5 2.5)')), ST_X(gs('POINT EMPTY')), ST_Y(gs('POINT EMPTY'));
+----
+1.5	2.5	NULL	NULL
+
+statement error
+SELECT ST_X(gs('LINESTRING (0 0, 1 1)'));
+----
+ST_X: geometry is not a POINT (got LINESTRING)
+
+statement error
+SELECT ST_Y(gs('MULTIPOINT (0 0)'));
+----
+ST_Y: geometry is not a POINT (got MULTIPOINT)
+
+# --- Bounding box: NULL for empty geometries ---
+
+query IIII
+SELECT ST_XMin(g), ST_XMax(g), ST_YMin(g), ST_YMax(g)
+FROM (SELECT gs('GEOMETRYCOLLECTION (POINT (-3 7), POLYGON ((0 0, 10 0, 10 10, 0 0)), MULTILINESTRING ((20 -5, 21 -6)))') AS g);
+----
+-3.0	21.0	-6.0	10.0
+
+query IIII
+SELECT ST_XMin(g), ST_XMax(g), ST_YMin(g), ST_YMax(g) FROM (SELECT gs('GEOMETRYCOLLECTION EMPTY') AS g);
+----
+NULL	NULL	NULL	NULL
+
+query I
+SELECT ST_XMin(gs('POINT EMPTY'));
+----
+NULL
+
+# --- Decimal values round-trip exactly at their scale ---
+
+query III
+SELECT ST_X(gs('POINT (0.1 0.3)')), ST_Y(gs('POINT (0.1 0.3)')), ST_AsText(geosilo_decode(gs('LINESTRING (0.1 0.2, 0.3 0.7)')));
+----
+0.1	0.3	LINESTRING (0.1 0.2, 0.3 0.7)
+
+# --- Z / M / ZM round trips (DuckDB stores ISO WKB) ---
+
+query I
+SELECT ST_AsText(geosilo_decode(gs(w))) = ST_AsText(w::GEOMETRY) FROM (VALUES
+    ('POINT Z (1 2 3)'), ('POINT M (1 2 4)'), ('POINT ZM (1 2 3 4)'),
+    ('LINESTRING Z (0 0 0, 1 1 1)'), ('LINESTRING M (0 0 1, 1 1 2)'), ('LINESTRING ZM (0 0 1 2, 1 1 3 4)'),
+    ('POLYGON Z ((0 0 1, 1 0 1, 1 1 1, 0 0 1))'), ('POLYGON ZM ((0 0 1 2, 1 0 1 2, 1 1 1 2, 0 0 1 2))'),
+    ('MULTIPOINT Z (0 0 0, 1 1 1)'), ('MULTIPOINT M (0 0 5, 1 1 6)'),
+    ('MULTILINESTRING ZM ((0 0 0 0, 1 1 1 1), (2 2 2 2, 3 3 3 3))'),
+    ('MULTIPOLYGON Z (((0 0 0, 1 0 0, 1 1 0, 0 0 0)))'),
+    ('GEOMETRYCOLLECTION Z (POINT Z (1 2 3), LINESTRING Z (0 0 0, 1 1 1))'),
+    ('GEOMETRYCOLLECTION M (POINT M (1 2 3), POLYGON M ((0 0 1, 1 0 1, 1 1 1, 0 0 1)))')
+) t(w);
+----
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+
+query III
+SELECT m.vertex_type, ST_XMax(g), ST_NPoints(g)
+FROM (SELECT gs(w) AS g, geosilo_metadata(gs(w)) AS m FROM (VALUES
+    ('POINT Z (1 2 3)'), ('LINESTRING M (0 0 1, 5 1 2)'), ('POLYGON ZM ((0 0 1 2, 9 0 1 2, 9 1 1 2, 0 0 1 2))')) t(w));
+----
+XYZ	1.0	1
+XYM	5.0	2
+XYZM	9.0	4
+
+# --- Empty geometries round trip ---
+
+query I
+SELECT ST_AsText(geosilo_decode(gs(w))) FROM (VALUES ('POINT EMPTY'), ('LINESTRING EMPTY'), ('POLYGON EMPTY'),
+    ('MULTIPOINT EMPTY'), ('MULTILINESTRING EMPTY'), ('MULTIPOLYGON EMPTY'), ('GEOMETRYCOLLECTION EMPTY')) t(w);
+----
+POINT EMPTY
+LINESTRING EMPTY
+POLYGON EMPTY
+MULTIPOINT EMPTY
+MULTILINESTRING EMPTY
+MULTIPOLYGON EMPTY
+GEOMETRYCOLLECTION EMPTY
+
+# --- Scale validation ---
+
+statement error
+SELECT geosilo_encode('POINT (1 2)'::GEOMETRY, 0);
+----
+geosilo_encode: scale must be a positive integer, got 0
+
+statement error
+SELECT geosilo_encode('POINT (1 2)'::GEOMETRY, -100);
+----
+geosilo_encode: scale must be a positive integer, got -100
+
+query I
+SELECT geosilo_encode('POINT (1 2)'::GEOMETRY, NULL);
+----
+NULL
+
+# coordinates must fit in int32 after scaling (huge scales no longer overflow int64 silently)
+statement error
+SELECT geosilo_encode('POINT (300 0)'::GEOMETRY);
+----
+overflows int32 at scale 10000000
+
+statement error
+SELECT geosilo_encode('POINT (1 0)'::GEOMETRY, 9223372036854775807);
+----
+overflows int32
+
+query I
+SELECT ST_AsText(geosilo_decode(geosilo_encode('POINT (1 2)'::GEOMETRY, 1)));
+----
+POINT (1 2)
+
+# --- NULLs, table columns (non-constant vectors) and a per-row scale ---
+
+statement ok
+CREATE TABLE shapes AS SELECT * FROM (VALUES
+    (1, 'POINT (1 2)'::GEOMETRY, 100),
+    (2, NULL, 1000),
+    (3, 'LINESTRING (0 0, 3 4)'::GEOMETRY, NULL),
+    (4, 'POLYGON ((0 0, 4 0, 4 3, 0 3, 0 0))'::GEOMETRY, 10000000),
+    (5, 'MULTIPOINT (1 1, 2 2)'::GEOMETRY, 1)
+) t(id, g, s);
+
+query IIIIII
+SELECT id, ST_AsText(geosilo_decode(geosilo_encode(g, s))), geosilo_metadata(geosilo_encode(g, s)).scale,
+       ST_NPoints(g::GEOSILO), ST_Area(g::GEOSILO), ST_Length(g::GEOSILO)
+FROM shapes ORDER BY id;
+----
+1	POINT (1 2)	100	1	0.0	0.0
+2	NULL	NULL	NULL	NULL	NULL
+3	NULL	NULL	2	0.0	5.0
+4	POLYGON ((0 0, 4 0, 4 3, 0 3, 0 0))	10000000	5	12.0	0.0
+5	MULTIPOINT (1 1, 2 2)	1	2	0.0	0.0
+
+query IIIII
+SELECT id, ST_X(g), ST_XMin(g), ST_IsEmpty(g), ST_GeometryType(g)
+FROM (SELECT id, gs(w) AS g FROM (VALUES (1, 'POINT (1 2)'), (2, NULL), (3, 'POINT EMPTY')) t(id, w)) ORDER BY id;
+----
+1	1.0	1.0	false	POINT
+2	NULL	NULL	NULL	NULL
+3	NULL	NULL	true	POINT
+
+# Stored GEOSILO column round trip
+statement ok
+CREATE TABLE stored (id INTEGER, g GEOSILO);
+
+statement ok
+INSERT INTO stored SELECT id, g FROM shapes;
+
+query III
+SELECT id, ST_AsText(g::GEOMETRY), geosilo_is_valid(g) FROM stored ORDER BY id;
+----
+1	POINT (1 2)	true
+2	NULL	NULL
+3	LINESTRING (0 0, 3 4)	true
+4	POLYGON ((0 0, 4 0, 4 3, 0 3, 0 0))	true
+5	MULTIPOINT (1 1, 2 2)	true

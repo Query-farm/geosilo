@@ -16,7 +16,7 @@ query II
 SELECT function_name, example
 FROM (SELECT DISTINCT function_name, unnest(examples) AS example
       FROM duckdb_functions()
-      WHERE function_name LIKE 'geosilo%' OR list_contains(parameter_types, 'GEOSILO'))
+      WHERE function_name LIKE 'geosilo%' OR function_name LIKE 'try_geosilo%' OR list_contains(parameter_types, 'GEOSILO'))
 ORDER BY ALL;
 ----
 ST_Area	ST_Area(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))'))::GEOSILO)
@@ -38,15 +38,21 @@ geosilo_encode	geosilo_encode(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'))
 geosilo_encode	geosilo_encode(ST_GeomFromText('LINESTRING(500000.25 4649776.75, 500010.5 4649780)'), 100)
 geosilo_encode	geosilo_encode(ST_Point(1, 2))
 geosilo_encode	geosilo_encode(ST_Point(1.234, 5.678), 1000000)
+geosilo_is_valid	geosilo_is_valid('\x00\x01'::BLOB)
+geosilo_is_valid	geosilo_is_valid(geosilo_encode(ST_Point(1, 2)))
 geosilo_metadata	geosilo_metadata(geosilo_encode(ST_Point(1, 2)))
 geosilo_metadata	geosilo_metadata(geosilo_encode(ST_Point(1, 2))::GEOSILO)
+geosilo_validate	geosilo_validate('\x47\x01'::BLOB)
+geosilo_validate	geosilo_validate(geosilo_encode(ST_Point(1, 2)))
+try_geosilo_decode	try_geosilo_decode('\x54\xff'::BLOB)
+try_geosilo_decode	try_geosilo_decode(geosilo_encode(ST_Point(1, 2)))
 
 # --- Run each example verbatim ---
 
 query I
 SELECT ST_Area(geosilo_encode(ST_GeomFromText('POLYGON((0 0, 4 0, 4 3, 0 3, 0 0))'))::GEOSILO);
 ----
-11.999999999999998
+12.0
 
 query I
 SELECT ST_GeometryType(geosilo_encode(ST_Point(1, 2))::GEOSILO);
@@ -139,6 +145,36 @@ query I
 SELECT geosilo_metadata(geosilo_encode(ST_Point(1, 2))::GEOSILO);
 ----
 {'geometry_type': POINT, 'vertex_type': XY, 'scale': 10000000}
+
+query I
+SELECT geosilo_is_valid('\x00\x01'::BLOB);
+----
+false
+
+query I
+SELECT geosilo_is_valid(geosilo_encode(ST_Point(1, 2)));
+----
+true
+
+query I
+SELECT geosilo_validate('\x47\x01'::BLOB);
+----
+GeoSilo: blob too small for a GEOSILO header
+
+query I
+SELECT geosilo_validate(geosilo_encode(ST_Point(1, 2)));
+----
+NULL
+
+query I
+SELECT try_geosilo_decode('\x54\xff'::BLOB);
+----
+NULL
+
+query I
+SELECT try_geosilo_decode(geosilo_encode(ST_Point(1, 2)));
+----
+POINT (1 2)
 
 # --- BLOB -> GEOSILO cast ---
 

@@ -6,7 +6,7 @@ require geosilo
 
 query II
 SELECT DISTINCT function_name, parameters FROM duckdb_functions()
-WHERE function_name IN ('ST_Area', 'ST_GeometryType', 'ST_IsEmpty', 'ST_Length', 'ST_NPoints', 'ST_Perimeter', 'ST_X', 'ST_XMax', 'ST_XMin', 'ST_Y', 'ST_YMax', 'ST_YMin', 'geosilo_decode', 'geosilo_encode', 'geosilo_metadata')
+WHERE function_name IN ('ST_Area', 'ST_GeometryType', 'ST_IsEmpty', 'ST_Length', 'ST_NPoints', 'ST_Perimeter', 'ST_X', 'ST_XMax', 'ST_XMin', 'ST_Y', 'ST_YMax', 'ST_YMin', 'geosilo_decode', 'geosilo_encode', 'geosilo_metadata', 'geosilo_is_valid', 'geosilo_validate', 'try_geosilo_decode')
 ORDER BY ALL;
 ----
 ST_Area	[geom]
@@ -25,8 +25,14 @@ geosilo_decode	[blob]
 geosilo_decode	[geom]
 geosilo_encode	[geometry]
 geosilo_encode	[geometry, scale]
+geosilo_is_valid	[blob]
+geosilo_is_valid	[geom]
 geosilo_metadata	[blob]
 geosilo_metadata	[geom]
+geosilo_validate	[blob]
+geosilo_validate	[geom]
+try_geosilo_decode	[blob]
+try_geosilo_decode	[geom]
 
 # The parameters are still positional: calls work as before
 

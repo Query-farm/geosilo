@@ -1,0 +1,200 @@
+# name: test/sql/geosilo_malformed.test
+# description: malformed GEOSILO blobs (truncated, bit-flipped, wrong type, huge counts, deep nesting) raise
+#              errors (or NULL / false from the try_ / validation functions) and never crash the process
+# group: [geosilo]
+
+require geosilo
+
+# --- Crash reproducers from the security review ---
+
+# compact LINESTRING claiming 2^31-1 points with no data (previously SIGBUS)
+statement error
+SELECT geosilo_decode('\x54\xff\xff\xff\x7f'::BLOB);
+----
+GeoSilo: element count 2147483647 exceeds the remaining 0 bytes
+
+# compact LINESTRING claiming 4096 points with no data (previously SIGSEGV)
+statement error
+SELECT geosilo_decode('\x54\x00\x10\x00\x00'::BLOB);
+----
+GeoSilo: element count 4096 exceeds the remaining 0 bytes
+
+# count larger than the data could hold
+statement error
+SELECT geosilo_decode('\x54\x03\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x01\x00'::BLOB);
+----
+GeoSilo: element count 3 exceeds the remaining 10 bytes
+
+# count passes the size pre-check but the second vertex is cut short
+statement error
+SELECT geosilo_decode('\x54\x02\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x01\x00'::BLOB);
+----
+GeoSilo: input is truncated or malformed
+
+# escaped int32 delta cut short
+statement error
+SELECT geosilo_decode('\x54\x02\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x00\x80\x01'::BLOB);
+----
+GeoSilo: input is truncated or malformed
+
+# empty blob: geosilo_metadata used to read past the end
+statement error
+SELECT geosilo_metadata(''::BLOB);
+----
+GeoSilo: blob is empty
+
+statement error
+SELECT geosilo_decode(''::BLOB);
+----
+GeoSilo: blob is empty
+
+# truncated compact POINT
+statement error
+SELECT geosilo_decode('\x50\x01\x02'::BLOB);
+----
+GeoSilo: input is truncated or malformed
+
+# wrong magic / unsupported version / bad geometry type / bad vertex type / bad scale in a full header
+statement error
+SELECT geosilo_decode('\x99'::BLOB);
+----
+GeoSilo: invalid magic byte 0x99
+
+statement error
+SELECT geosilo_decode('\x47\x09\x01\x00\x80\x96\x98\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB);
+----
+GeoSilo: unsupported version 9
+
+statement error
+SELECT geosilo_metadata('\x47\x01\x00\x00\x80\x96\x98\x00\x00\x00\x00\x00'::BLOB);
+----
+GeoSilo: invalid geometry type 0
+
+statement error
+SELECT geosilo_metadata('\x47\x01\x01\x07\x80\x96\x98\x00\x00\x00\x00\x00'::BLOB);
+----
+GeoSilo: invalid vertex type 7
+
+statement error
+SELECT geosilo_decode('\x47\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB);
+----
+GeoSilo: invalid scale in header
+
+statement error
+SELECT geosilo_decode('\x47\x01\x01\x00\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB);
+----
+GeoSilo: invalid scale in header
+
+# invalid child type inside a GEOMETRYCOLLECTION
+statement error
+SELECT geosilo_decode('\x47\x01\x07\x00\x80\x96\x98\x00\x00\x00\x00\x00\x01\x00\x00\x00\x2a\x00\x00\x00\x00'::BLOB);
+----
+GeoSilo: invalid geometry type 42 in collection
+
+# GEOMETRYCOLLECTION claiming 2^32-1 parts
+statement error
+SELECT geosilo_decode('\x47\x01\x07\x00\x80\x96\x98\x00\x00\x00\x00\x00\xff\xff\xff\xff'::BLOB);
+----
+GeoSilo: element count 4294967295 exceeds the remaining 0 bytes
+
+# --- Nesting depth is capped (unbounded recursion used to overflow the stack) ---
+
+# 200 nested GEOMETRYCOLLECTIONs
+statement error
+SELECT geosilo_decode(unhex('47010700' || '8096980000000000' || repeat('0100000007', 200) || '00000000'));
+----
+exceeds the maximum nesting depth
+
+query I
+SELECT geosilo_validate(unhex('47010700' || '8096980000000000' || repeat('0100000007', 200000) || '00000000'));
+----
+GeoSilo: geometry exceeds the maximum nesting depth of 16
+
+# 10 levels is fine
+query I
+SELECT ST_AsText(geosilo_decode(unhex('47010700' || '8096980000000000' || repeat('0100000007', 10) || '00000000')));
+----
+GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (GEOMETRYCOLLECTION EMPTY))))))))))
+
+# --- try_ / validation functions never raise for malformed input ---
+
+query IIII
+SELECT try_geosilo_decode(b) IS NULL, geosilo_is_valid(b), geosilo_validate(b) IS NOT NULL, TRY_CAST(b AS GEOSILO) IS NULL
+FROM (VALUES ('\x54\xff\xff\xff\x7f'::BLOB), ('\x54\x00\x10\x00\x00'::BLOB), (''::BLOB), ('\x47'::BLOB), ('\x50\x01'::BLOB)) t(b);
+----
+true	false	true	true
+true	false	true	true
+true	false	true	true
+true	false	true	true
+true	false	true	true
+
+# trailing bytes: decode tolerates them, validation (and the BLOB -> GEOSILO cast) rejects them
+query II
+SELECT ST_AsText(geosilo_decode(b)), geosilo_validate(b)
+FROM (SELECT geosilo_encode('POINT (1 2)'::GEOMETRY) || '\x00'::BLOB AS b);
+----
+POINT (1 2)	GeoSilo: 1 unexpected trailing bytes
+
+statement error
+SELECT (geosilo_encode('POINT (1 2)'::GEOMETRY) || '\x00'::BLOB)::GEOSILO;
+----
+GeoSilo: 1 unexpected trailing bytes
+
+# NULL in, NULL out
+query IIII
+SELECT try_geosilo_decode(NULL::BLOB), geosilo_is_valid(NULL::BLOB), geosilo_validate(NULL::BLOB), geosilo_metadata(NULL::BLOB);
+----
+NULL	NULL	NULL	NULL
+
+# --- Generated corpus: every truncation and three bit flips of every byte of several encodings ---
+
+statement ok
+CREATE TABLE sources AS SELECT * FROM (VALUES
+    (1, geosilo_encode('GEOMETRYCOLLECTION (POINT (1 2), LINESTRING (0 0, 1 1, 300 2), POLYGON ((0 0, 10 0, 10 10, 0 0), (1 1, 2 1, 2 2, 1 1)), MULTIPOINT (1 1, 2 2))'::GEOMETRY, 1000)),
+    (2, geosilo_encode('MULTIPOLYGON (((0 0, 10 0, 10 10, 0 0)), ((20 20, 30 20, 30 30, 20 20), (21 21, 22 21, 22 22, 21 21)))'::GEOMETRY)),
+    (3, geosilo_encode('LINESTRING Z (0 0 0, 1 1 1, 100 100 100)'::GEOMETRY)),
+    (4, geosilo_encode('MULTILINESTRING M ((0 0 1, 5 5 2), (6 6 3, 7 7 4))'::GEOMETRY, 100)),
+    (5, geosilo_encode('POLYGON ZM ((0 0 1 2, 10 0 1 2, 10 10 1 2, 0 0 1 2))'::GEOMETRY)),
+    (6, geosilo_encode('POINT (-75.5 40.25)'::GEOMETRY)),
+    (7, geosilo_encode('MULTIPOINT (0 0, 1 1, 2 2)'::GEOMETRY, 1000))
+) t(id, b);
+
+statement ok
+CREATE TABLE truncated AS
+SELECT id, n, unhex(substr(hex(b), 1, 2 * n)) AS b FROM sources, LATERAL range(0, octet_length(sources.b)) r(n);
+
+statement ok
+CREATE TABLE flipped AS
+SELECT id, i, m, unhex(substr(h, 1, 2 * i) || printf('%02X', xor(('0x' || substr(h, 2 * i + 1, 2))::INTEGER, m)) || substr(h, 2 * i + 3)) AS b
+FROM (SELECT id, hex(b) AS h, octet_length(b) AS len FROM sources) s,
+     LATERAL range(0, s.len) r(i),
+     (VALUES (1), (128), (255)) f(m);
+
+# No strict prefix of a valid encoding is valid, and none of them decode
+query II
+SELECT count(*) FILTER (WHERE geosilo_is_valid(b)), count(try_geosilo_decode(b)) FROM truncated;
+----
+0	0
+
+# Every corrupted blob is handled without crashing; anything that validates also decodes and renders as WKT,
+# and the GEOSILO ST_* functions work on it.
+query I
+SELECT count(*) > 0 FROM flipped;
+----
+true
+
+query I
+SELECT count(*) FROM flipped WHERE geosilo_is_valid(b) AND try_geosilo_decode(b) IS NULL;
+----
+0
+
+statement ok
+SELECT ST_AsText(try_geosilo_decode(b)), geosilo_validate(b) FROM flipped;
+
+statement ok
+SELECT ST_NPoints(g), ST_IsEmpty(g), ST_XMin(g), ST_YMax(g), ST_Area(g), ST_Length(g), ST_Perimeter(g), ST_GeometryType(g)
+FROM (SELECT TRY_CAST(b AS GEOSILO) AS g FROM flipped) WHERE g IS NOT NULL;
+
+statement ok
+SELECT ST_NPoints(g), ST_XMax(g), ST_Area(g)
+FROM (SELECT TRY_CAST(b AS GEOSILO) AS g FROM truncated) WHERE g IS NOT NULL;
